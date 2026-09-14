@@ -47,7 +47,7 @@ struct Params {
     height: u32,      // original image height
     padded_w: u32,    // padded (tile-aligned) width
     padded_h: u32,    // padded (tile-aligned) height
-    fill_mode: u32,   // 0 = replicate (pre-PAD-1 behaviour), 1 = replicate then fade flat
+    fill_mode: u32,   // 0 = replicate, 1 = replicate then fade flat, 2 = zero (PAD-2 / Dirac)
     _pad0: u32,
     _pad1: u32,
     _pad2: u32,
@@ -110,7 +110,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let below = y >= params.height;
     let right = x >= params.width;
 
-    if (params.fill_mode == 0u || !(below || right)) {
+    if (!(below || right)) {
+        output[dst] = input[src];
+        output[dst + 1u] = input[src + 1u];
+        output[dst + 2u] = input[src + 2u];
+        return;
+    }
+
+    // PAD-2 candidate (Dirac/Schroedinger inter): zero-extend so a zero-padded current
+    // against a zero-padded reference differences to nothing in the padding itself.
+    if (params.fill_mode == 2u) {
+        output[dst] = 0.0;
+        output[dst + 1u] = 0.0;
+        output[dst + 2u] = 0.0;
+        return;
+    }
+
+    if (params.fill_mode == 0u) {
         // Visible pixels are copied unchanged on both paths, and so is everything when the fill
         // is switched back to plain replication.
         output[dst] = input[src];

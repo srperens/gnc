@@ -54,7 +54,9 @@ impl Y4mReader {
         let mut reader = std::io::BufReader::new(file);
 
         let mut header = String::new();
-        reader.read_line(&mut header).expect("Y4M header read failed");
+        reader
+            .read_line(&mut header)
+            .expect("Y4M header read failed");
         let header = header.trim_end_matches('\n').trim_end_matches('\r');
         assert!(
             header.starts_with("YUV4MPEG2"),
@@ -87,8 +89,19 @@ impl Y4mReader {
                 _ => {}
             }
         }
-        assert!(width > 0 && height > 0, "Y4M header missing W/H in {}", path);
-        Y4mReader { reader, width, height, fps_num, fps_den, chroma_420 }
+        assert!(
+            width > 0 && height > 0,
+            "Y4M header missing W/H in {}",
+            path
+        );
+        Y4mReader {
+            reader,
+            width,
+            height,
+            fps_num,
+            fps_den,
+            chroma_420,
+        }
     }
 
     /// Skip `n` frames without decoding them (seek forward by frame bytes).
@@ -110,16 +123,25 @@ impl Y4mReader {
             let mut line = String::new();
             loop {
                 line.clear();
-                let bytes_read = self.reader.read_line(&mut line).expect("Y4M skip: read_line error");
+                let bytes_read = self
+                    .reader
+                    .read_line(&mut line)
+                    .expect("Y4M skip: read_line error");
                 if bytes_read == 0 {
                     return; // EOF
                 }
-                if line.trim_end_matches('\n').trim_end_matches('\r').starts_with("FRAME") {
+                if line
+                    .trim_end_matches('\n')
+                    .trim_end_matches('\r')
+                    .starts_with("FRAME")
+                {
                     break;
                 }
             }
             // Consume raw YUV data
-            self.reader.read_exact(&mut skip_buf).expect("Y4M skip: truncated frame data");
+            self.reader
+                .read_exact(&mut skip_buf)
+                .expect("Y4M skip: truncated frame data");
         }
     }
 
@@ -132,7 +154,11 @@ impl Y4mReader {
             if n == 0 {
                 return None; // EOF
             }
-            if line.trim_end_matches('\n').trim_end_matches('\r').starts_with("FRAME") {
+            if line
+                .trim_end_matches('\n')
+                .trim_end_matches('\r')
+                .starts_with("FRAME")
+            {
                 break;
             }
         }
@@ -141,7 +167,9 @@ impl Y4mReader {
         let h = self.height as usize;
 
         let mut y_plane = vec![0u8; w * h];
-        self.reader.read_exact(&mut y_plane).expect("Y4M: truncated Y plane");
+        self.reader
+            .read_exact(&mut y_plane)
+            .expect("Y4M: truncated Y plane");
 
         let (cb_plane, cr_plane) = if self.chroma_420 {
             let uw = w.div_ceil(2);
@@ -149,14 +177,22 @@ impl Y4mReader {
             let uv_size = uw * uh;
             let mut cb = vec![0u8; uv_size];
             let mut cr = vec![0u8; uv_size];
-            self.reader.read_exact(&mut cb).expect("Y4M: truncated Cb plane");
-            self.reader.read_exact(&mut cr).expect("Y4M: truncated Cr plane");
+            self.reader
+                .read_exact(&mut cb)
+                .expect("Y4M: truncated Cb plane");
+            self.reader
+                .read_exact(&mut cr)
+                .expect("Y4M: truncated Cr plane");
             (cb, cr)
         } else {
             let mut cb = vec![0u8; w * h];
             let mut cr = vec![0u8; w * h];
-            self.reader.read_exact(&mut cb).expect("Y4M: truncated Cb (444) plane");
-            self.reader.read_exact(&mut cr).expect("Y4M: truncated Cr (444) plane");
+            self.reader
+                .read_exact(&mut cb)
+                .expect("Y4M: truncated Cb (444) plane");
+            self.reader
+                .read_exact(&mut cr)
+                .expect("Y4M: truncated Cr (444) plane");
             (cb, cr)
         };
 
@@ -270,7 +306,7 @@ fn test_bbb_scene_cuts_250_600() {
 
     // Encode all complete GOPs
     let num_gops = TOTAL_FRAMES / GOP_SIZE; // 351 / 4 = 87
-    let tail_start = num_gops * GOP_SIZE;   // 87 * 4 = 348
+    let tail_start = num_gops * GOP_SIZE; // 87 * 4 = 348
     let tail_count = TOTAL_FRAMES - tail_start; // 3
 
     eprintln!(
@@ -374,27 +410,19 @@ fn test_bbb_scene_cuts_250_600() {
     );
 
     // Check GNV2 magic
-    assert_eq!(
-        &serialized[0..4],
-        b"GNV2",
-        "Expected GNV2 container magic"
-    );
+    assert_eq!(&serialized[0..4], b"GNV2", "Expected GNV2 container magic");
 
     let deserialized = format::deserialize_temporal_sequence(&serialized);
 
     assert_eq!(
-        deserialized.frame_count,
-        TOTAL_FRAMES,
+        deserialized.frame_count, TOTAL_FRAMES,
         "Deserialized frame_count mismatch: expected {}, got {}",
-        TOTAL_FRAMES,
-        deserialized.frame_count
+        TOTAL_FRAMES, deserialized.frame_count
     );
     assert_eq!(
-        deserialized.gop_size,
-        GOP_SIZE,
+        deserialized.gop_size, GOP_SIZE,
         "Deserialized gop_size mismatch: expected {}, got {}",
-        GOP_SIZE,
-        deserialized.gop_size
+        GOP_SIZE, deserialized.gop_size
     );
     assert_eq!(
         deserialized.groups.len(),
@@ -514,8 +542,16 @@ fn test_bbb_scene_cuts_250_600() {
 #[ignore = "requires test_material/frames/sequences/bbb_2min/bbb_2min.y4m"]
 fn test_bbb_2min_y4m_header() {
     let reader = Y4mReader::open(Y4M_PATH);
-    assert!(reader.width >= 640, "Expected at least 640px wide, got {}", reader.width);
-    assert!(reader.height >= 360, "Expected at least 360px tall, got {}", reader.height);
+    assert!(
+        reader.width >= 640,
+        "Expected at least 640px wide, got {}",
+        reader.width
+    );
+    assert!(
+        reader.height >= 360,
+        "Expected at least 360px tall, got {}",
+        reader.height
+    );
     assert!(reader.fps_num > 0, "fps_num should be > 0");
     assert!(reader.fps_den > 0, "fps_den should be > 0");
     eprintln!(

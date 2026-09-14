@@ -1697,7 +1697,11 @@ impl<'a> FreqBitReader<'a> {
     fn read_bit(&mut self) -> u32 {
         // Past the end reads as zero: a truncated or corrupt tile must not panic before its CRC
         // is checked (the lesson from conformance_crc_detects_corruption).
-        let byte = if self.pos < self.data.len() { self.data[self.pos] } else { 0 };
+        let byte = if self.pos < self.data.len() {
+            self.data[self.pos]
+        } else {
+            0
+        };
         let b = (byte >> (7 - self.bit)) & 1;
         self.bit += 1;
         if self.bit == 8 {

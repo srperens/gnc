@@ -136,11 +136,41 @@ Three different quantities have been called "encode fps" here. State which one, 
 
 | | what it times | measured 2026-09-06 (1080p, ki=8, Rice, **the Mac, labelled M1 — see above**, machine not idle) |
 |---|---|---|
-| **A — GPU encode phase** | `benchmark-sequence` with Y4M input | 12.2 fps median |
-| **B — encoder loop** | the figure `encode-sequence` prints | 5.6 fps median |
-| **C — end to end** | wall clock around `encode-sequence`, PNG input | 5.0 fps median |
+| **A — GPU encode phase** | `benchmark-sequence` with Y4M input | **27.8 fps** (was 12.2) |
+| **B — encoder loop** | the figure `encode-sequence` prints — **includes PNG decode**, see below | **19.4 fps** (was 5.6) |
+| **C — end to end** | wall clock around `encode-sequence`, PNG input | **15.4 fps** (was 5.0) |
 
-**A is 2.4x C.** Use A to compare against another codec's encoder, C to claim throughput.
+**Re-taken 2026-09-08 on an idle machine (MEAS-12), median of 3, same parameters — 1080p, 8 frames,
+`--keyframe-interval 8`, q=75, Rice.** The old column was measured on 2026-09-06 with up to eight
+sessions on this Mac and **every quantity was understated by 2.3x to 3.5x**. `--throughput`
+(BUG-32) changes quantity A by under 1%: the CPU metrics were always outside the encode timer, so
+BUG-32's 86% finding applies to the command's wall clock and not to this table's figures.
+
+**A is 1.8x C**, not 2.4x. Use A to compare against another codec's encoder, C to claim throughput.
+
+**Quantity B was never an encoder figure, and the tool now says so (BUG-53, 2026-09-08).**
+`encode-sequence` reads PNG and calls its frame source *inside* the timed region, so every PNG
+decode lands in the figure it prints. Measured directly by the command now: **123.7 ms of 460.4 ms
+— 27%**, about 15 ms per 1080p frame. It prints three lines instead of one:
+
+```
+Encoded 8 frames (1I + 7P) in 460.4ms (17.4 fps) — includes PNG decode
+  of which input decode 123.7ms (27%); coding alone 336.7ms (23.8 fps)
+```
+
+So **B splits into 23.8 fps of coding and 17.4 fps combined**, and the 19.4 fps in the table above
+is the combined figure from a run without the split. **Quote the coding line against another
+encoder.** It still does not equal quantity A (23.8 against 27.8 fps): the residue is the rest of
+`encode-sequence`'s host-side loop, which is the same 29-of-65-ms finding MEAS-12 decomposed.
+**PNG input is not a sensible way to measure fps at all** — `benchmark-sequence` with Y4M avoids
+the decode entirely, which is what quantity A is.
+
+**The decomposition is the useful part, because it says where the time is not going.** Per frame:
+GPU encode phase **36 ms**, encoder loop **51 ms**, end to end **65 ms** — so **29 of the 65 ms is
+not GPU coding work.** And doubling the chroma sample count costs **1%**: quantity C reads 15.41 fps
+at 4:4:4 against 15.61 fps at 4:2:0, which on its own establishes that end-to-end sequence
+throughput is host-bound rather than coding-bound. Against the 60 fps target (16.7 ms/frame) the
+GPU phase alone is 2.2x short, so both halves need work — but they are different work.
 `benchmark-sequence --throughput` (BUG-32, 2026-09-08) is the CLI form of A without the CPU
 PSNR/SSIM tax that used to be 86% of that command's wall clock. Default `benchmark-sequence`
 still scores every frame; do not time it.
@@ -152,6 +182,50 @@ VMAF, dE00) are deterministic and unaffected; fps and latency are not.
 **The 31.7 fps figure GOALS and the README quoted until 2026-09-07 is not reproducible** and matches none of the three. Its
 stated parameters are also inconsistent — "ki=8 ... I+P+B", but ki=8 is below the B-frame
 threshold of 9, and the encoder emits 2I+8P. Do not build a density claim on it.
+
+> **2026-09-14: the default entropy coder changed, so every rate figure below is from the previous
+> default.** ENT-10 (`docs/decisions/0053`) made **abac** the default for q > 20; rANS still holds
+> q ≤ 20. abac codes **11.9% to 20.7% fewer bits than Rice at identical pixels** over stills,
+> sequences, a held static shot and a sparse gradient, for 1.7x-5.4x encode and 1.0x-2.3x decode.
+>
+> **So the headline gap moves and this file has not caught up.** The **+89.2% BD-rate** against
+> x264 quoted here, in GOALS §1 and in POSITIONING is a **Rice** figure; MEAS-11 recorded **+61.0%**
+> with abac, at cb=64 and before ENT-14 — i.e. before both of the day's improvements. **Every
+> `--abac` row in this file predates `0051` and ENT-14 too.** The re-take is MEAS-11 and it is now
+> a re-take of the shipped default rather than of an option. Until it is done, read every rate row
+> below as "what the previous default did".
+
+## Stream density is a pixel rate, and on a laptop GPU it is ~70-90 Mpixel/s (2026-09-14, PERF-4)
+
+**This is a *reach* number, not a *scale* number** (GOALS §1). It says what an integrated 30 W
+laptop GPU carries. It says nothing about the professional server card GNC's density claim is
+actually about — that measurement has never been taken on any machine, and it is **MEAS-15**.
+
+`gnc density`, one device per stream, q=90, steady state only (no setup in the window), on the
+machine `gnc gpu-info` calls **Apple M1 Pro, 16 cores, 16 GB**. **There are two Macs** — the other
+is the M5 Pro / 20 cores / 64 GB of CLAUDE.md's Platform Notes, and it is **unmeasured** (MEAS-15).
+A Mac row without its machine is not comparable to another Mac row. Binary
+`codec-fingerprint 6a9fa6bd`.
+
+| resolution | one stream | ceiling | streams to reach it | Mpixel/s at the ceiling |
+|---|---|---|---|---|
+| 1280x720 | 46.00 fps | 76.47 fps | 4 | **70.5** |
+| 1920x1080 | 21.69 fps | 34.16 fps | 4 | **70.8** |
+| 3840x2160 | 7.58 fps | 10.72 fps | 2 | **88.9** |
+
+**Quote the Mpixel/s, not the fps and not the instance count.** The fps ceiling moves 7x across
+that range and the pixel rate does not, which is what identifies the limit as GPU throughput
+rather than per-frame or per-process overhead. **One 1080p stream uses ~64% of this GPU** — the
+gap is PERF-5 — and two streams reach the ceiling.
+
+**`--density-still`'s scaling column is not this measurement.** Its N=1 reads 7.27 fps against the
+23.4 above, because its wall clock contains device creation, pipeline build, PNG decode and the
+CPU quality metrics; its 1.69x/1.85x/1.98x is largely those costs amortising. Use it for "what an
+operator sees running N processes", `--density-inproc` for "what this GPU carries".
+
+Setup, for anyone pricing an instance: device 12.9 ms, `EncoderPipeline::new` **24.8 ms** with a
+warm OS shader cache (1 987 ms on the first run after a build), RSS **230 MB** per process and
+~80 MB per additional in-process stream. `docs/decisions/0085`.
 
 ## A second GPU, and the first figures not taken on the Mac (2026-09-07)
 
@@ -166,7 +240,8 @@ shader's cost is paid by the feature that uses it. `docs/decisions/0029`.)*
 |---|---|---|---|
 | **RTX 4000 Ada (Vulkan)** | **13.95 ms** (71.7 fps) | **7.29 ms** (137.2 fps) | **21.2 ms** |
 | llvmpipe, CPU rasteriser (Vulkan) | 480.74 ms | 373.88 ms | 854.6 ms |
-| Apple M5 Pro (Metal), MEAS-6 2026-09-06 — logged as "M1" | ~47 ms | ~35 ms | ~80 ms |
+| **Apple M5 Pro (Metal), idle, 2026-09-08** | **15.34 ms** (65.2 fps) | **9.87 ms** (101.3 fps) | **25.2 ms** |
+| Apple M5 Pro (Metal), MEAS-6 2026-09-06, non-idle — logged as "M1" | ~47 ms | ~35 ms | ~80 ms |
 
 Reproduced at a second commit under 2x the load: 14.01 / 7.27 ms. **This is CANARY-1's quantity —
 the single-frame encode/decode loop — and it is a fourth thing that has been called "encode fps" in
@@ -174,7 +249,10 @@ this file.** It is nearest quantity **A** (GPU encode phase) and is not comparab
 
 **Do not quote the Mac row against the RTX row as a speedup.** It is cross-machine, cross-backend,
 possibly at a different q, and the Mac figure was taken by a different harness. The controlled
-version is one command — this same harness on an idle Mac — and it has not been run.
+version is one command — this same harness on an idle Mac — and **it was run on 2026-09-08**: the
+row above. Same script, same `--quality 90` default, same pinned input (`f83f355f…`), settle
+1.01/1.03. **The Mac is 1.19x slower than the RTX 4000 Ada** — the uncontrolled rows would have
+implied 3.8x, which is why this file said not to quote them against each other.
 
 **Cross-backend output, measured for the first time.** Same commit, same input: q=100 lossless is
 **byte-identical** between Metal and Vulkan (`5c4539d8…`, 3 235 737 B), and q=75 lossy **differs by
@@ -212,6 +290,16 @@ No fps is quoted — the machine was not idle.
 
 New section 2026-09-08 (LOSSLESS-2). There was no lossless *sequence* row here before, because
 until BUG-39 (`0064`) `q=100` video was not bit-exact and there was nothing to regress against.
+
+**These rows are 4:4:4 and PNG-sourced, so both of 2026-09-10's lossless fixes leave them
+alone** — verified byte-identical. `encode-sequence` reads PNG, whose samples are integral, which
+is the reason they survived; **any q=100 figure taken from a Y4M source before 2026-09-10 is
+superseded** and by a wide margin, because that path was not lossless at all (BUG-45, `0081`:
+bbb read PSNR 32.89 dB at 8.42 bpp, and now reads inf at 10.42 bpp). Rate and quality both moved,
+so such a figure cannot be adjusted — it has to be retaken. Every subsampled `q=100` figure taken **before** 2026-09-10 is superseded: at
+4:2:2/4:2:0 the lossless path was drifting inside each tile, so those encodes were both larger and
+2.7x to 20x worse in colour than they now are. **The non-444 rows exist as of 2026-09-11** and are
+in the Y4M section below (LOSSLESS-5). Numbers in RESEARCH_LOG, 2026-09-10.
 Container bytes, `encode-sequence`, and every frame md5-identical to its source PNG through
 `decode-sequence`:
 
@@ -230,6 +318,44 @@ up to **+69% for identical pixels**. `GNC_LOSSLESS_INTRA_RECODE=0` reproduces th
 
 Animation keeps its P-frames and its rows are unchanged. **No fps is quoted: eight sessions shared
 the GPU.**
+
+## Lossless sequences from a Y4M source, in the source's own colour space (q=100, 8 frames)
+
+New section 2026-09-11 (LOSSLESS-5, `0082` / `0083`). These are the first non-444 rows in this
+file, and the first Y4M-sourced lossless rows that mean anything: before 2026-09-10 that path was
+not lossless at all (BUG-45), and before today it converted to RGB with a matrix that cannot be
+undone.
+
+`benchmark-sequence -q 100`, both arms at the file's own **4:2:0**. The native arm is the default
+for a lossless request; `GNC_RGB_PATH=1 --chroma-format 420` is the control, and is what the
+column on the right is.
+
+| sequence (4:2:0) | ki | native | RGB, same format | delta | frames |
+|---|---|---|---|---|---|
+| bbb (animation) | 8 | **11 871 842** | 13 949 160 | −14.89% | 1I+7P |
+| blue_sky | 8 | **10 378 585** | 12 177 781 | −14.77% | 8I |
+| crowd_run | 8 | **16 679 183** | 18 596 938 | −10.31% | 8I |
+| old_town_cross | 8 | **15 952 107** | 17 940 092 | −11.08% | 8I |
+| **sum** | 8 | **54 881 717** | 62 663 971 | **−12.42%** | |
+| bbb | 2 | **12 291 502** | 14 749 351 | −16.66% | 4I+4P |
+| **sum** | 2 | **55 301 377** | 63 464 162 | **−12.86%** | |
+
+The camera rows are identical at ki=2 and ki=8 for the same reason the 4:4:4 rows above are: a
+lossless P-frame that costs more than an I-frame is re-coded (`0070`), so camera content converges
+to all-intra.
+
+**Every frame is bit-exact against the source's own Y'CbCr.** The one exception on the day this
+section was written — `bbb.y4m` frame 2 — was BUG-57, fixed the same afternoon (`0084`); the bbb
+rows above are the post-fix figures and are **+0.069% / +0.086%** on what that entry first recorded.
+The RGB arm is not bit-exact against the source at all in any of these rows, which is the point of
+the section rather than a caveat.
+
+bbb converted to its other two formats, same comparison: 4:2:2 **13 448 505** against 16 978 198,
+4:4:4 **17 789 345** against 24 084 895. Both deltas are larger than −13% because the RGB arm codes
+those all-intra, so they mix a colour-space change with a frame-type one; the 4:2:0 table is the
+clean one.
+
+**No fps is quoted: eight sessions shared the GPU.**
 
 ## Lossless sequences at q = 95..=99 (8 frames, 4:4:4, Rice)
 

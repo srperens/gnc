@@ -4,7 +4,7 @@
 
 GNC is a patent-free **video codec** designed from scratch for GPU parallelism. Everything runs as wgpu compute shaders (WGSL), written against the WebGPU feature set so the same source targets Metal, Vulkan, DX12 and WebGPU/WASM. The core idea: tile-independent processing with thousands of parallel threads instead of sequential CPU-era algorithms.
 
-**That is the design, and it is not yet fully the measured state.** As of 2026-09-08 every performance figure is **Metal**; on **Vulkan** intra *and* inter now run end to end on two independent implementations, with byte-identical output between them, but no inter throughput figure exists yet (BUG-25 **fixed** — `docs/decisions/0029`; the four driver crashes on record were all one upstream naga defect on invalid SPIR-V). DX12 has never been run beyond a software adapter that panicked, and the WASM path is unverified in a browser with one known limit breach (BUG-31). The README's *Portability, as measured* table is the current evidence and should be read before any claim of cross-platform support is repeated.
+**That is the design, and it is not yet fully the measured state.** As of 2026-09-08 every performance figure is **Metal**; on **Vulkan** intra *and* inter now run end to end on two independent implementations, with byte-identical output between them, but no inter throughput figure exists yet (BUG-25 **fixed** — `docs/decisions/0029`; the four driver crashes on record were all one upstream naga defect on invalid SPIR-V). DX12 has never been run beyond a software adapter that panicked. **The WASM path is verified as of 2026-09-10**: the decoder runs in Chrome *and* Safari on macOS — two independent WebGPU implementations, not two builds of one — through `examples/web/player.html`, on both containers (GNV1 I+P and GNV2 temporal wavelet), the whole quality ladder including the q=100 MED lossless path, all three chroma formats, and a full-length film in segments. **Browser *encode* remains impossible**, and rule 4 does not distinguish the two: `quantize_histogram_fused.wgsl` is on the default encode path and asks 23 800 B of workgroup storage against the 16 384 B a conformant WebGPU device guarantees (BUG-35). An earlier version of this line cited BUG-31 as an open limit breach; that was fixed 2026-09-08. The evidence is in the items themselves — `docs/decisions/0029` for Vulkan, **BUG-52** for DX12's compile-time wall and **BUG-35** for the encode-side limit breach that still keeps the *encoder* out of a browser — and should be read before any claim of cross-platform support is repeated. The README carries the one-line summary, not the evidence.
 
 ### GNC is broad on purpose — that is the decision, not an unresolved question (2026-09-07)
 
@@ -50,6 +50,45 @@ constant no matter how large and expensive the GPU is, while shader throughput s
 card. A bigger GPU should therefore buy more GNC instances; it does not buy more NVENC blocks.
 **That claim is currently unproven and is the single most important thing to measure** (MEAS-5).
 
+### The project is in phase 1, and phase 1 is bitrate (owner, 2026-09-14)
+
+**Everything in this section describes where GNC is going. Right now it is doing one thing:
+getting the compression within reach of H.264 and setting a baseline there.** The owner:
+*"Vi försöker få till hyfsad komprimering och sätta en baseline som är i närheten av H.264. Sen
+kommer andra aspekter att bli så mycket mera viktiga… då blir det parallella sessioner,
+performance, låg latency, robustness som blir fokus. Nu är vi fortfarande i forskning kring om
+designen för att möta bitrate."*
+
+So: **concurrent sessions, throughput, latency and robustness are phase 2.** They are real targets
+and they are not cancelled — they are simply not what a session should pick up while the rate gap
+is open. **The one consequence that reverses standing decisions: a rate win is worth taking even
+when it costs encode or decode time.** Several were declined on speed grounds that belong to
+phase 2. BACKLOG's Current Focus carries the queue this implies.
+
+Current score: **+89.2% BD-rate on PSNR against x264** at the contribution operating point, ~1.9x
+away from the target.
+
+### Reach and scale are two claims, on two classes of hardware (owner, 2026-09-14)
+
+The row above compresses two different promises into one line, and conflating them is how a
+laptop measurement ends up being read as a datacenter one. They are separate, they have separate
+evidence, and **a result must say which claim it is evidence for:**
+
+| | the claim | the hardware it is about | what it needs to be true |
+|---|---|---|---|
+| **reach** | GNC *runs* anywhere there is a GPU — phone, Raspberry Pi, Chromebook, laptop, browser | small, integrated, power-constrained parts | the WebGPU feature set, honestly requested limits (rule 4), and a decoder that works in a browser — verified 2026-09-10, §1 |
+| **scale** | GNC carries *many* concurrent streams on one card, where fixed-function silicon caps out | professional GPUs in a server hall — L40S, A10G, RTX 6000 Ada class | shader throughput that rises with the card, which is **MEAS-5 Claim B and is unmeasured** |
+
+**Reach is the one that is nearly proven and scale is the one that matters commercially.** The
+massive-density argument is about a datacenter part; it is not a claim about a MacBook, and the
+MacBook is not where it can be tested.
+
+**So `docs/decisions/0085`'s 70-90 Mpixel/s ceiling is a *reach* number, not a *scale* number.**
+It was measured on an Apple M1 Pro — an integrated laptop GPU sharing LPDDR5 with the CPU — and
+read as evidence for reach it is encouraging: a ~30 W laptop chip carries a 1080p stream with a
+third of the GPU still idle. Read as evidence about a server card it is worth nothing, and it must
+not be quoted that way. The same measurement on a discrete professional GPU is **MEAS-15**.
+
 Two things that follow, and they are about *measurement discipline*, not about narrowing scope:
 
 - **Every operating point is in scope, so a result must say which one it was measured at.** The
@@ -72,12 +111,12 @@ order rather than a format-specific feature.
 1. **Patent-free** — No patented techniques, period. If it's patented, we don't use it.
 2. **GPU-first** — Everything runs in compute shaders. No CPU fallback paths. CPU reference implementations only for validation/testing.
 3. **Massive parallelism via tile independence** — No cross-tile dependencies at any stage. Each tile encodes/decodes in isolation. This is what enables thousands of parallel GPU threads.
-4. **Cross-platform** — Must work on Metal, Vulkan, DX12, and WebGPU (WASM). No backend-specific features. WGSL shaders are the single source. **Half met as of 2026-09-08: Metal and Vulkan both run the whole codec; DX12 and the browser do not** — see §1. Portability is the axis the project claims to win on (§1), so a backend it cannot run on is a headline defect and not a compatibility nit.
+4. **Cross-platform** — Must work on Metal, Vulkan, DX12, and WebGPU (WASM). No backend-specific features. WGSL shaders are the single source. **Three-quarters met as of 2026-09-10: Metal and Vulkan run the whole codec, and the browser decodes on two independent WebGPU implementations; DX12 runs nothing, and the browser cannot encode (BUG-35)** — see §1. Portability is the axis the project claims to win on (§1), so a backend it cannot run on is a headline defect and not a compatibility nit.
 5. **No f64 in shaders** — Apple and mobile GPUs have no hardware double precision, and WGSL has no `f64` in any case.
 6. **Open source only** — All dependencies must be open source.
 7. **English only** — All code, comments, docs, and commit messages in English.
 8. **Measure everything** — Every change benchmarked: PSNR, SSIM, bpp, encode/decode FPS. Compare against baseline and previous best. Optionally compare against relevant codecs (H.264, H.265, AV1, MJPEG, JPEG XS, ProRes) for context.
-9. **No code duplication** — Extract shared logic. Code must pass `cargo fmt` and `cargo clippy` with zero warnings. The exact clippy commands are in CLAUDE.md, "Code Style": `--all-targets` on native since BUG-20 (`docs/decisions/0062`), `--lib` on wasm. **The `cargo fmt` half of this rule is currently false** — 566 diffs in 61 files, 504 of them under `src/` — filed as **BUG-38**, not yet decided.
+9. **No code duplication** — Extract shared logic. Code must pass `cargo fmt` and `cargo clippy` with zero warnings. The exact clippy commands are in CLAUDE.md, "Code Style": `--all-targets` on native since BUG-20 (`docs/decisions/0062`), `--lib` on wasm. **Both halves hold as of 2026-09-14**, verified on `dc50d8e` against all three gates: `cargo fmt --all --check`, `cargo clippy --release --all-targets` and `cargo clippy --release --target wasm32-unknown-unknown --lib`. BUG-38 cleared the 566-diff backlog on 2026-09-08 (63 files, one atomic commit); the 13 hunks that drifted back in since were formatted in `707da83`, and the last clippy warning — a `nonminimal_bool` in `pipeline.rs` — went with `aa4bb71`. The rule has been false in this file more often than it has been true, so re-run the three commands before trusting this line rather than quoting it.
 10. **No legacy** — Nobody runs GNC in production. We can break the bitstream format, change the container, rename fields, restructure anything. No backward compatibility constraints.
 11. **Video codec first** — GNC is a video codec, not an image codec. Sequence encode/decode performance is the primary metric. Single-frame performance only matters as a component of video throughput.
 
@@ -104,7 +143,9 @@ fps" exists.*
 **Sequence encode: see [BASELINE.md](BASELINE.md) — three different quantities have been called
 "encode fps" and they differ by 2.4x.** The previously quoted 31.7 fps is not reproducible and its
 stated parameters are internally inconsistent (ki=8 cannot produce B-frames). Measured 2026-09-06
-on a non-idle machine: GPU encode phase 12.2 fps, end to end 5.0 fps.
+on a non-idle machine: GPU encode phase 12.2 fps, end to end 5.0 fps. **Both re-taken on an idle
+machine 2026-09-08 (MEAS-12): 27.8 fps and 15.4 fps** — the earlier figures were understated 2.3x
+and 3.1x by a shared machine.
 
 **What works:**
 - Full I/P/B frame video pipeline with motion estimation, rate control, GNV1 container
@@ -112,12 +153,15 @@ on a non-idle machine: GPU encode phase 12.2 fps, end to end 5.0 fps.
 - Fused quantize+histogram shader
 - 128+ tests, golden-baseline regression, 5 conformance bitstreams
 - 33 WGSL compute shaders
-- WASM/WebGPU decoder builds (263 KB)
+- WASM/WebGPU decoder **runs in a browser** — Chrome and Safari on macOS, 2026-09-10; 628 KB from `wasm-pack --release`. The web player in `examples/web/` plays GNV1 and GNV2, seeks, and auto-advances a segmented film
 
 **Key GPU architecture insight:** shared-memory occupancy dominates performance. 16KB is the budget because that is what **GNC requests** (wgpu defaults, for WebGPU portability) — the adapter here offers 32KB, so this is a self-imposed ceiling, not the chip's (BUG-29). At 16KB, 2 workgroups/core is full occupancy; Rice uses < 1KB shared, so occupancy is excellent.
 
 **Known gaps:**
-- Sequence encode: **12.2 fps GPU encode phase, 5.0 fps end to end** (BASELINE's A and C,
+- Sequence encode: **27.8 fps GPU encode phase, 15.4 fps end to end** — re-taken on an idle machine
+  2026-09-08 (MEAS-12); the 12.2 / 5.0 this line carried were understated 2.3x and 3.1x by a shared
+  Mac. **29 of the 65 ms per frame is not GPU coding work**, and doubling the chroma sample count
+  costs 1%, so the end-to-end figure is host-bound. (BASELINE's A and C,
   1080p q=75, non-idle machine) → target 60 fps. The 31.7 fps this line used to carry is the
   figure retracted four paragraphs above; it stood here for a day after being withdrawn.
 - Single-frame encode 40 fps → target 60 fps
@@ -234,8 +278,8 @@ GNC should become a **good, robust codec** — not optimized along a single axis
 | Property | Current | Target |
 |----------|---------|--------|
 | **Concurrent streams per GPU** | **never measured** | beat NVENC's session/block ceiling on the same machine |
-| **Latency per frame** | **~80 ms round trip at the default**, of which **0 frames** are reordering delay (MEAS-6, `docs/decisions/0033`). Below the low-latency-HEVC band's 120 ms floor, above JPEG XS. The structural half is exact; the ~80 ms coding half is a non-idle measurement and is owed on an idle machine, and glass-to-glass is still unmeasured | sub-frame, end to end — at 50 fps that is 20 ms, so ~80 ms is four frames short |
-| Encode speed | 12.2 fps GPU encode phase / 5.0 fps end to end (seq, 1080p q=75, non-idle; BASELINE A and C) | 60 fps |
+| **Latency per frame** | **25.2 ms round trip at the default** — 15.34 ms encode / 9.87 ms decode, idle machine 2026-09-08 — of which **0 frames** are reordering delay (MEAS-6, `docs/decisions/0033`). Below the low-latency-HEVC band's 120 ms floor, above JPEG XS. **The ~80 ms this row carried until 2026-09-08 was about 3.2x inflated by a shared machine**; the structural half was never a timing measurement and is unchanged. Glass-to-glass is still unmeasured and needs capture hardware | sub-frame, end to end — at 50 fps that is 20 ms, so 25.2 ms is **1.26 frames** — essentially at target |
+| Encode speed | **27.8 fps GPU encode phase / 15.4 fps end to end** (seq, 1080p q=75, **idle machine**, MEAS-12 2026-09-08; BASELINE A and C). The 12.2 / 5.0 this row carried was a shared machine. 29 of the 65 ms per frame is not coding | 60 fps — the GPU phase alone is 2.2x short, and the host-side half is nearly as large |
 | Bit depth | **8-bit and 10-bit, both shipping** (FMT-1, 2026-09-06; 10-bit lossless re-verified 2026-09-08) | met — keep it met as the format changes |
 | Chroma formats | 4:4:4, 4:2:2, 4:2:0 | keep all three working at 10-bit |
 | Compression (intra) | **Read these three numbers with their caveats, they are not one quantity.** +46–55% vs H.264 all-I on video is **VMAF, predates the high-q ladder fix and has not been re-run** (BASELINE says so); +13.9% on stills is PSNR against H.264 all-I; and against JPEG 2000 9/7 the gap is +27.1% of which **15.1 points are not coding deficiencies at all**, so the intra *coding* gap is nearer **+12%** (INTRA-1, answered 2026-09-08) | ≤ H.264 all-I, measured at contribution quality — and re-run the VMAF figure as PSNR |
@@ -252,7 +296,7 @@ the whole positioning rests on. They come before further compression work." One 
 measured and the other cannot be, so as written it directs every session at work that is either
 done or impossible:
 
-- **Latency per frame is measured** (MEAS-6, ~80 ms, 0 frames of reordering). What is left is the
+- **Latency per frame is measured** (MEAS-6, **25.2 ms** on an idle machine, 0 frames of reordering). What is left is the
   cheap half — re-take the coding time on an idle machine — and glass-to-glass instrumentation
   that nobody has built.
 - **Concurrent streams per GPU is parked, not skipped.** Claim A (no session cap, and it runs

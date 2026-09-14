@@ -135,7 +135,11 @@ fn a_dead_zone_of_half_a_step_changes_nothing() {
         let v = i as f32 * step / 1000.0;
         let plain = (v / step + 0.5).floor();
         for dz in [0.0_f32, 0.25, 0.5] {
-            let gated = if v < dz * step { 0.0 } else { (v / step + 0.5).floor() };
+            let gated = if v < dz * step {
+                0.0
+            } else {
+                (v / step + 0.5).floor()
+            };
             assert_eq!(
                 gated, plain,
                 "dz={dz} changed the quantiser at |v|={v}: {gated} vs {plain}"
@@ -145,7 +149,11 @@ fn a_dead_zone_of_half_a_step_changes_nothing() {
     // And 0.75 — the anchor value at q<=75 — genuinely is not a no-op, or the item is vacuous.
     let v = 0.6 * step;
     assert_ne!(
-        if v < 0.75 * step { 0.0 } else { (v / step + 0.5).floor() },
+        if v < 0.75 * step {
+            0.0
+        } else {
+            (v / step + 0.5).floor()
+        },
         (v / step + 0.5).floor(),
         "dz=0.75 should zero a value the plain quantiser keeps"
     );

@@ -32,6 +32,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fingerprint  # noqa: E402  (sibling script, not a package)
+
 REPO = Path(
     subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True,
                    check=True).stdout.strip()
@@ -69,6 +72,8 @@ def main():
         sys.exit(f"no binary at {GNC} — cargo build --release first")
     print(subprocess.run(["shasum", "-a", "256", str(GNC)], capture_output=True,
                          text=True).stdout.split()[0], "(binary, hash-recorded)")
+    fp = fingerprint.read(GNC)
+    print(f"codec-fingerprint {fp} — COORD-6: two numbers carrying the same one are comparable")
     print()
     cases = ([(q, 444, k) for q in (95, 99, 100) for k in (2, 9)]
              + [(99, 420, 2), (100, 420, 2)])
@@ -99,6 +104,7 @@ def main():
             print(f"{seq:<16}{q:>5}{chroma:>8}{k:>4}{len(a):>8}{took_a:>13}"
                   f"{sum(x[2] for x in a):>10}  {note}")
     print()
+    fingerprint.check_unchanged(GNC, fp)
     print(f"route fired on {fired_total} I-frame(s) across the sweep")
     if bad:
         print(f"FAIL: {bad} problem(s) above")

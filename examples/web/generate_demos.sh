@@ -58,11 +58,11 @@ encode() {                       # encode <outfile> <source> <frames> [flags...]
 }
 
 echo "Removing previous demo files..."
-rm -f "$OUT"/*.gnv "$OUT"/*.gnv2 "$OUT"/*.log
+rm -f "$OUT"/*.gnv "$OUT"/*.gnv2 "$OUT"/*.gnc "$OUT"/*.log
 
 # --- Watchable material: whole clips at the default preset -----------------------------------
 # The comparison groups below are deliberately short; these are the ones you actually watch.
-echo "1/4  Full clips at q=75 — material to watch"
+echo "1/6  Full clips at q=75 — material to watch"
 watch() {                        # watch <name> <clip> <frames> [flags...]
     local name="$1" clip="$2" frames="$3"; shift 3
     local src; src=$(pick "$clip") || { printf '  %-26s skipped (no source)\n' "$name.gnv"; return; }
@@ -76,7 +76,7 @@ watch watch_bbb_2min        bbb_2min        600      # 20 s at 30 fps — animat
 src_ducks=$(pick ducks_take_off) && encode "$OUT/watch_ducks_q50.gnv" "$src_ducks" 300 -q 50
 
 echo
-echo "2/4  Quality range — short and uniform, for A/B"
+echo "2/6  Quality range — short and uniform, for A/B"
 for q in 25 50 75 92; do
     encode "$OUT/range_q${q}.gnv" "$CLIP_MAIN" 24 -q "$q"
 done
@@ -86,15 +86,63 @@ done
 encode "$OUT/range_q100_lossless.gnv" "$CLIP_MAIN" 24 -q 100
 
 echo
-echo "3/4  Temporal mode — same clip, same q"
+echo "3/6  Temporal mode — same clip, same q"
 encode "$OUT/temporal_ip.gnv"    "$CLIP_MOTION" 24 -q 75 --temporal-wavelet none
 encode "$OUT/temporal_haar.gnv2" "$CLIP_MOTION" 24 -q 75 --temporal-wavelet haar
 
+# Sequences fetched as PNG frames rather than Y4M need `encode-sequence`; `benchmark-sequence`
+# takes a single Y4M file. Several of the clips the watch group wants arrive this way.
+encode_png() {                   # encode_png <outfile> <seqname> <frames> [flags...]
+    local out="$1" name="$2" frames="$3"; shift 3
+    [ -f "$SEQ/$name/frame_0000.png" ] || { printf '  %-26s skipped (no PNG frames)\n' "$(basename "$out")"; return; }
+    printf '  %-26s ' "$(basename "$out")"
+    if "$GNC" encode-sequence -i "$SEQ/$name/frame_%04d.png" -o "$out" \
+         --keyframe-interval 8 --num-frames "$frames" "$@" \
+         > "${out}.log" 2>&1; then
+        printf '%12s bytes\n' "$(wc -c < "$out" | tr -d ' ')"
+    else
+        printf 'FAILED (%s)\n' "$(basename "$out").log"
+    fi
+}
+
+encode_png "$OUT/watch_old_town_cross.gnv" old_town_cross 24 -q 75
+encode_png "$OUT/watch_crowd_run.gnv"      crowd_run      24 -q 75
+encode_png "$OUT/watch_bbb_extended.gnv"   bbb_extended   24 -q 75
+
 echo
-echo "4/4  Chroma format — same clip, same q"
+echo "4/6  Chroma format — same clip, same q"
 for fmt in 444 422 420; do
     encode "$OUT/chroma_${fmt}.gnv" "$CLIP_CHROMA" 24 -q 50 --chroma-format "$fmt"
 done
+
+echo
+echo "5/6  Lossless at subsampled chroma — BUG-49 (2026-09-10, docs/decisions/0080)"
+# Until 2026-09-10 these two were the broken ones: the box filter handed MED a fractional plane,
+# the step-1 quantiser rounded it, and the error drifted across each tile — 2.7x to 20x worse in
+# colour than q=99, with 4:2:2 somehow worse than 4:2:0. Both now decode bit-exact for the plane
+# they code. The 4:4:4 arm is the control that was always exact.
+for fmt in 444 422 420; do
+    encode "$OUT/lossless_${fmt}.gnv" "$CLIP_MAIN" 24 -q 100 --chroma-format "$fmt"
+done
+
+echo
+echo "6/6  Single frames for index.html"
+# index.html has always linked to these three names; nothing generated them after the four old
+# scripts were replaced, so its sample links were dead. They are stills, not sequences, and the
+# manifest does not carry them — index.html's list is hardcoded and these names match it.
+STILL="$ROOT/test_material/frames/bbb_1080p.png"
+if [ -f "$STILL" ]; then
+    for q in 25 75 100; do
+        printf '  %-26s ' "still_q${q}.gnc"
+        if "$GNC" encode -i "$STILL" -o "$OUT/still_q${q}.gnc" -q "$q" > "$OUT/still_q${q}.gnc.log" 2>&1; then
+            printf '%12s bytes\n' "$(wc -c < "$OUT/still_q${q}.gnc" | tr -d ' ')"
+        else
+            printf 'FAILED (still_q%s.gnc.log)\n' "$q"
+        fi
+    done
+else
+    echo "  no bbb_1080p.png — index.html's sample links will stay dead"
+fi
 
 echo
 echo "Writing demos.json manifest..."

@@ -20,12 +20,32 @@
 
 use super::abac::Coder;
 
-/// Code-block edge in pixels. 64 is the measured optimum once decode throughput is priced in:
-/// against Rice on real coefficients at q=90 it is −13.8% rate at 33.0 ms of entropy decode,
-/// where cb=32 is −10.9% at 31.4 ms — cb=64 dominates. Larger blocks code better still (cb=128 is
-/// −20.0% at q=55) but `abac_decode.wgsl` keeps two rows of neighbour magnitudes per thread in
-/// workgroup memory and is sized for 64.
-pub const DEFAULT_CB: u32 = 64;
+/// Code-block edge in pixels. **32 since ENT-10 (2026-09-14, `docs/decisions/0086`).**
+///
+/// This was 64, on a measurement that said cb=64 dominated once decode was priced in: "−13.8%
+/// rate at 33.0 ms of entropy decode, where cb=32 is −10.9% at 31.4 ms". **The rate half of that
+/// still reproduces; the decode half does not, because the decoder it was measured on no longer
+/// exists.** ENT-5 moved abac decode onto the GPU, one thread per code-block — and thread count
+/// *is* the code-block count, so halving the edge quadruples the parallelism of both the encoder
+/// and the decoder. On today's path (3 stills x q ∈ {90,99}, `gnc benchmark`, idle M1 Pro):
+///
+/// | | rate vs Rice | encode vs Rice | frame decode vs Rice |
+/// |---|---|---|---|
+/// | cb=64 | −14.1% to −17.5% | **5.0x to 12.0x** | **2.6x to 4.8x** |
+/// | cb=32 | −11.8% to −14.9% | **2.2x to 5.1x** | **1.3x to 2.1x** |
+///
+/// So cb=32 gives back ~2.5 to 3.5 points of rate and buys **2.3x off encode and ~2x off decode**,
+/// 6 of 6 points. The old note's 33.0 → 31.4 ms could not have predicted that: it is a 5% move
+/// where the whole frame decode moves 2x, which is how you can tell it was measuring a different
+/// decoder. **A number carries its codec** (COORDINATION).
+///
+/// Smaller still is not better: cb=16 buys ~8% more encode speed for +17% rate against cb=64's
+/// +3.8%, so 32 is the knee, not a slide. Larger is capped anyway — `abac_decode.wgsl` keeps two
+/// rows of neighbour magnitudes per thread in workgroup memory and is sized for 64.
+///
+/// `cb` is written per tile, so this is an encoder default and not a format change: a decoder
+/// reads whatever the stream says, and files written at cb=64 keep decoding.
+pub const DEFAULT_CB: u32 = 32;
 
 /// One tile's worth of code-block streams.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,7 +94,11 @@ fn subbands(tile_size: usize, num_levels: u32) -> Vec<(usize, usize, usize, usiz
 /// statistics and different orientations, and the context model is built on the assumption that a
 /// block is homogeneous. Deep subbands smaller than `cb` become one short block each; at tile 256
 /// with 5 levels that is the 8×8 LL plus three 8×8 level-5 bands, 0.4% of the tile.
-pub fn code_blocks(tile_size: usize, num_levels: u32, cb: usize) -> Vec<(usize, usize, usize, usize)> {
+pub fn code_blocks(
+    tile_size: usize,
+    num_levels: u32,
+    cb: usize,
+) -> Vec<(usize, usize, usize, usize)> {
     code_blocks_banded(tile_size, num_levels, cb)
         .into_iter()
         .map(|(x, y, w, h, _)| (x, y, w, h))
@@ -150,7 +174,22 @@ pub fn abac_encode_tile(
             let row = (by + y) * ts + bx;
             blk.extend_from_slice(&coefficients[row..row + bw]);
         }
-        let bytes = coder.encode_block(&blk, bw);
+        // **ENT-14: an all-zero block costs one varint, not a coded stream.** Every block used to
+        // pay a terminated arithmetic interval — ~11.5 B measured — whether or not it held a
+        // single significant coefficient, and on sparse content that floor *was* the file: a
+        // 512x512 gradient came out 2.3x larger than Rice, all of it 840 empty blocks.
+        //
+        // **This is an encoder-side change and nothing else.** A zero-length stream already
+        // decodes to zeros on both coders — `empty_stream_decodes_to_zeros` proves it rather
+        // than assuming it — because the decoders read past the end as zero bytes and the initial
+        // contexts then resolve every significance bit to "not significant". So the bitstream
+        // format is untouched, no generation moves, existing decoders read these tiles correctly,
+        // and files written before this change are unaffected.
+        let bytes = if blk.iter().all(|&c| c == 0) {
+            Vec::new()
+        } else {
+            coder.encode_block(&blk, bw)
+        };
         block_lengths.push(bytes.len() as u32);
         block_data.extend_from_slice(&bytes);
         covered += blk.len();
@@ -370,7 +409,11 @@ mod tests {
             let blob = serialize_tile_abac(&tile);
             assert_eq!(blob.len(), tile.byte_size());
             let (back, consumed) = deserialize_tile_abac(&blob);
-            assert_eq!(consumed, blob.len(), "deserialiser must consume the whole blob");
+            assert_eq!(
+                consumed,
+                blob.len(),
+                "deserialiser must consume the whole blob"
+            );
             assert_eq!(back, tile);
             assert_eq!(abac_decode_tile(&back), coeffs);
         }
@@ -381,12 +424,24 @@ mod tests {
         let coeffs = vec![0i32; 256 * 256];
         let tile = abac_encode_tile(&coeffs, 256, 5, DEFAULT_CB, Coder::Range);
         assert_eq!(abac_decode_tile(&tile), coeffs);
-        // 25 blocks, each a handful of bytes. Anything near the coefficient count means the
+        // A handful of bytes per code-block. Anything near the coefficient count means the
         // significance contexts are not learning.
+        //
+        // **The bound is per block, not a flat 512**, and the history is the reason: it was flat,
+        // and it failed when ENT-10 moved `DEFAULT_CB` 64 → 32 and the block count went 25 → 100
+        // (763 bytes) — a correct consequence of the change reading as a regression, which is what
+        // a flat bound on a derived quantity does.
+        //
+        // Since **ENT-14** an empty block costs only its length varint, so this now passes with
+        // enormous slack; the tight assertion lives in `tests/abac_empty_blocks.rs`, which pins
+        // the lengths to zero rather than the total to a ceiling. Kept here as the cheap in-module
+        // smoke test it always was.
+        let blocks = code_blocks(256, 5, DEFAULT_CB as usize).len();
         assert!(
-            tile.byte_size() < 512,
-            "an all-zero 256x256 tile cost {} bytes",
-            tile.byte_size()
+            tile.byte_size() < 20 * blocks,
+            "an all-zero 256x256 tile cost {} bytes over {blocks} code-blocks ({:.1} per block)",
+            tile.byte_size(),
+            tile.byte_size() as f64 / blocks as f64
         );
     }
 }

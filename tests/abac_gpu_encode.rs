@@ -90,7 +90,10 @@ fn gpu_encode_matches_cpu_encoder_byte_for_byte() {
                 );
                 let st = enc.stats();
                 assert_eq!(st.bytes, bytes, "stats must report what was produced");
-                assert!(st.blocks > 0, "the canary must count the blocks it dispatched");
+                assert!(
+                    st.blocks > 0,
+                    "the canary must count the blocks it dispatched"
+                );
                 eprintln!(
                     "  {w}x{h} ts={ts} levels={levels} cb={cb} {coder:?} {sizing:?}: \
                      {bytes} B, {} blocks, scratch {} B ({:.1}x output), {} coder pass(es)",
@@ -151,9 +154,8 @@ fn gpu_encode_round_trips_through_gpu_decode() {
 
     for coder in [Coder::Interval, Coder::Range] {
         for sizing in [Sizing::CountThenEmit, Sizing::BoundedSlots] {
-            let tiles = enc.encode_plane_to_tiles(
-                ctx, &input, w, tx, ty, ts, levels, cb, coder, sizing,
-            );
+            let tiles =
+                enc.encode_plane_to_tiles(ctx, &input, w, tx, ty, ts, levels, cb, coder, sizing);
 
             // Flatten to the decoder's block table, in plane coordinates.
             let mut packed: Vec<u8> = Vec::new();
@@ -161,8 +163,9 @@ fn gpu_encode_round_trips_through_gpu_decode() {
             for (t, tile) in tiles.iter().enumerate() {
                 let origin = (t / tx) * ts as usize * w + (t % tx) * ts as usize;
                 let mut off = 0usize;
-                for (i, (bx, by, bw, bh)) in
-                    code_blocks(ts as usize, levels, cb as usize).into_iter().enumerate()
+                for (i, (bx, by, bw, bh)) in code_blocks(ts as usize, levels, cb as usize)
+                    .into_iter()
+                    .enumerate()
                 {
                     let len = tile.block_lengths[i] as usize;
                     infos.push(BlockInfo::new(
@@ -188,7 +191,10 @@ fn gpu_encode_round_trips_through_gpu_decode() {
                 diff, 0,
                 "GPU encode -> GPU decode must be exact ({coder:?}, {sizing:?})"
             );
-            eprintln!("  round trip {coder:?} {sizing:?}: {} B, max |diff| 0", packed.len());
+            eprintln!(
+                "  round trip {coder:?} {sizing:?}: {} B, max |diff| 0",
+                packed.len()
+            );
         }
     }
 }

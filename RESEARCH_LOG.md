@@ -4,6 +4,1319 @@
 
 ---
 
+## ENT-12 — direction in the context is a ~1% lever, not the other half of the J2K gap (CLOSED by measurement 2026-09-14)
+
+**Machine-independent: deterministic numpy over DWT+quantised coefficients — no GPU, no wall clock,
+so unlike a throughput figure this reproduces anywhere.** Ran under Python 3.12 / numpy 1.26.
+`scripts/meas_ent12_pattern.py`, new; reuses `meas4_oracle` and `cond_entropy_bits` from the
+existing `meas_ebcot_context.py`.
+
+### Hypothesis and why it was worth a measurement, not a shader
+
+abac buckets a neighbourhood magnitude **sum** into its context. A sum discards direction: a
+horizontal edge and a vertical edge with the same neighbour-magnitude total land in the same
+context, where EBCOT's orientation-separated zero-coding contexts keep them apart — and edge
+orientation is exactly what a wavelet subband's own orientation makes informative. ENT-4 measured
+abac closing **exactly half** the +54% RGB gap to JPEG 2000 9/7, so ~27 points are unaccounted for,
+and this was a candidate for part of it. The item was filed with its own falsification test: measure
+conditional entropy, don't build a bitstream.
+
+### Method — a clean isolation, direction and nothing else
+
+Domain: quantised wavelet coefficients (the coder's own input). The two arms share the coder
+(significant? / |v|>1 / |v|>2 as context-coded binary decisions, then a bypassed Exp-Golomb
+remainder and sign — common-mode, so they cancel in the delta), share the four *causal* neighbours a
+parallel-safe decode already has (left, up, up-left+up-right), and share a static per-subband table.
+They differ in **one** thing:
+
+- **sum** context = (subband, bucket(magL + magU + magD)) — abac's model
+- **dir** context = (subband, bucket(magL), bucket(magU), bucket(magD)) — direction kept
+
+Both charged the same 0.5·log2(n)-per-context KT cost, which is what punishes the dir arm for having
+more contexts to fill (B³=64 vs 12 per subband). **+KT is the number to believe; raw overstates the
+win because more contexts mechanically lowers conditional entropy.**
+
+### Result — 4 images (animation / low-motion / camera 720p / sport), 3 qsteps
+
+| image | dir vs sum (raw ceiling) | dir vs sum (+KT, fair) |
+|---|---|---|
+| bbb (animation) | −1.1% … −1.2% | −0.4% … −0.9% |
+| blue_sky (low-motion) | −1.6% … −1.7% | −0.7% … −1.2% |
+| kristensara (camera) | −3.0% … −4.6% | −2.1% … −2.6% |
+| touchdown (sport) | −1.3% … −1.6% | −0.5% … −1.0% |
+
+Direction buys **~1% typically (fair accounting often sub-1%), ~2.6% at best** on high-detail camera
+content. Against the pre-registered criterion — *"if it does not move more than a few percent of the
+remaining 27 points, the hypothesis is wrong and the gap is somewhere else"* — this **fails the
+bar**. Direction is a real but marginal lever, not the missing half-gap.
+
+**Corroborated independently by the existing harness**, which contains both models under a different
+binarisation: on `meas_ebcot_context.py`, abac's own sum-based code-block coder (`cb64`, −11.0% to
+−14.5% vs rice-split) already **beats** the pattern-based EBCOT ceiling (`ebcot`, −5.8% to −6.2%).
+Two independent paths agree that spatial-context direction is not where the residue sits.
+
+### Caveats
+
+- Conditional entropy is a **ceiling**; a built static-table coder reaches less. The truth sits
+  between raw and +KT, both small.
+- Luma stills; ENT-4's gap was RGB stills — comparable, not identical.
+- Deterministic, so reproducibility is exact: the bbb and blue_sky rows were byte-identical across
+  two runs (the >5%-variance gate is trivially met at zero variance).
+
+### Verdict
+
+**Close ENT-12 as falsified-by-measurement**, the way the item was designed to be closeable. What
+remains of the J2K gap is not context direction — the next hypothesis has to look elsewhere (ENT-8's
+stripes, or upstream of the entropy coder in the transform/quantiser, per `docs/decisions/0024`).
+
+---
+
+## ENT-14 — an empty code-block now costs one byte, and that turned abac's worst case into its best (2026-09-14)
+
+**Machine: Apple M1 Pro, 16 cores, 16 GB, Metal.** `codec-fingerprint fb2fe82a` → **`027e58bc`**.
+`docs/decisions/0053`, superseding `0052`.
+
+### The fix, and the property that made it free
+
+An all-zero code-block codes to **no bytes at all** instead of a terminated arithmetic interval.
+The reason that needed no format change was **tested, not assumed**: a zero-length stream already
+decodes to zeros on both engines (`empty_stream_decodes_to_zeros`), because the decoders read past
+the end as zero bytes and the initial contexts resolve every significance decision to "not
+significant". **The format already expressed "this block is nothing"; the encoder simply never said
+it.** So no generation moved, old files are unaffected, and existing decoders read the new streams.
+
+Three places had to agree — the CPU reference in `abac_tile.rs`, and `block_is_empty` in
+`abac_encode.wgsl` used by both coder entry points *and* by `bound`. The existing byte-identity
+gate is what proves they do. One degenerate case became reachable: a plane whose every block is
+empty codes to zero total bytes, and `read_buffer_u32` panics on a zero-sized staging buffer.
+
+**Canary:** `empty=264` of 280 blocks on the gradient — and **`empty=420..476` of 2800 on a
+photograph.** 15-17% of blocks are empty even on busy content, which is why this helped everywhere
+rather than only in the corner it was filed for.
+
+### What it did
+
+| | before | after |
+|---|---|---|
+| gradient q=25 | **+234.5%** | **−8.7%** |
+| gradient q=90 | +64.7% | −27.9% |
+| stills q=25..85 | −10.1% to −15.0% | **−12.9% to −20.7%** |
+| sequences q=90 | −12.3% to −17.4% | −12.7% to **−17.8%** |
+
+**And the case `0052` said was the real risk.** Its sequence rows were all busy content; a held
+static shot was unmeasured. One real 1920x1080 frame held nine times: **q=90 −16.7%, q=99 −16.9%.**
+The predicted worst case is abac's **best** case.
+
+All five of ENT-14's criteria, written before the work, are met; two are exceeded — the gradient
+target was ±5% of Rice and came in at −8.7% to −27.9%.
+
+### So the flip landed: abac is the default above the rANS cutoff
+
+`quality_preset` selects `Abac` for q > 20. **The cutoff did not move**, and that is a finding: abac
+loses to rANS below it and wins above it at the same q, measured *before* ENT-14 so those are its
+floor (q=15 +5.8/+0.3/−0.1, q=20 +1.6/−2.8/−3.4, q=25 −6.0/−7.2/−7.9). **Cost in the same breath as
+the win: 1.7x-5.4x encode, 1.0x-2.3x decode.** ENT-10 closes after six days blocked on exactly that
+number.
+
+### The sizing grid, run the same hour another session asked for it
+
+Their ENT-5 handoff wanted `abac_encode_throughput_grid` on an idle Mac against a Windows prior
+(RTX 2000 Ada) of **1.54x** for one coder pass against two. M1 Pro, Metal, best of 24, `med/best`
+1.02-1.03 — **with ENT-14 in the build, which the Windows prior did not have**:
+
+| path | bytes | plane ms | frame ms |
+|---|---|---|---|
+| GPU Range / CountThenEmit (2 passes) | 395 501 | 51.97 | **155.92** |
+| GPU Range / BoundedSlots (1 pass) | 395 501 | 32.49 | **97.46** |
+| CPU Range, one thread | 395 501 | 26.57 | **79.71** |
+
+**The Windows ratio reproduces on Metal: 1.60x.** Bytes identical across the pair, as required.
+**`0017` reason 2 / ENT-5 criterion 3 is discharged**: 97.46 ms/frame against the 129 ms that
+record quotes.
+
+**Two findings in that table that are not footnotes.** (1) The single-threaded **CPU** coder is
+*faster than the GPU one* — 79.71 against 97.46 ms/frame, on a 16-core GPU, for 2800 independent
+blocks. (2) A whole-frame `gnc benchmark` moves only **1.10x-1.27x** between the sizing modes where
+the coder stage moves 1.60x, so **the coder stage is a minority of abac's frame encode time.**
+**ENT-13 was filed on the assumption that double-coding is the main cost. It is not**, and that
+item must be re-read before anyone starts it — the readback and submission path is the larger half.
+
+### What is now owed
+
+BASELINE, GOALS §1 and POSITIONING quote **+89.2% BD-rate** against x264 with Rice, and MEAS-11
+recorded **+61.0%** with abac. That re-take is now a re-take of the **default**, not of an option,
+and every `--abac` row in BASELINE predates both `0051` and ENT-14.
+
+---
+
+## ENT-10 step 2 — abac's rate case is overwhelming and it is still not the default (2026-09-14)
+
+**Machine: Apple M1 Pro, 16 cores, 16 GB, Metal.** Binary `codec-fingerprint fb2fe82a` (post-
+`0051`) throughout, unchanged either side — the default did not move. `docs/decisions/0052`.
+
+### Hypothesis and criteria, set first
+
+abac replaces Rice above the rANS cutoff if it codes fewer bits at identical pixels across ≥3
+sequences and ≥2 quality points, intra and inter, and the phase-1 rule (a rate win is worth an
+encode cost) covers the difference. `0045` predicted the saving would decay on inter to −3.7%; the
+open question was whether it still does.
+
+### The rate side, and it is not close
+
+Identical pixels everywhere — **0.00 dB PSNR delta in every channel at every point**, which is what
+a lossless recode of the same quantised coefficients must give and is the control that says the
+comparison is honest.
+
+**Stills**, 3 photographic images, abac vs Rice, q ∈ {25,50,75,85,90,95,99,100}: **−10.1% to
+−15.0%**, no decay at either end. **q=100 included**: both coders stay bit-exact (PSNR `inf`) and
+abac is 11.8–14.9% smaller.
+
+**Sequences**, `benchmark-sequence -n 9 -k 9`, four clips:
+
+| | q=90 | q=95 | q=99 |
+|---|---|---|---|
+| crowd_run | −12.3% | −12.8% | −12.8% |
+| rush_hour | **−16.8%** | −14.1% | −13.4% |
+| stockholm | −13.1% | −11.9% | −11.8% |
+| bbb | **−17.4%** | −15.9% | −14.1% |
+
+**`0045`'s inter decay is gone** — −3.7% at q=99 reads −11.8% to −17.4% now. Superseded by ENT-9
+and `0051` changing the coder under it, not by an error in it. (crowd_run q=95 and q=99 are one
+point, not two: LOSSLESS-3 emits it bit-exact at both.)
+
+**And the rANS cutoff did not need moving, which is a finding rather than a convenience.** abac
+loses below it and wins above it on all three images at the same q — q=15: +5.8% / +0.3% / −0.1%;
+q=20: +1.6% / −2.8% / −3.4%; q=25: −6.0% / −7.2% / −7.9%. Whatever makes rANS strong at four
+decomposition levels makes abac weak there too.
+
+The flip was made on that.
+
+### Then `regression_gradient_q50` failed, in seconds
+
+**bpp 0.3379 against a 0.2397 ceiling, +41%.** On a 512x512 synthetic gradient:
+
+| q | Rice | abac cb=64 | abac cb=32 |
+|---|---|---|---|
+| 25 | 3 227 B | +100.6% | **+234.5%** |
+| 50 | 3 636 B | +88.4% | +207.2% |
+| 75 | 5 232 B | +39.5% | +122.1% |
+| 90 | 7 849 B | +9.1% | **+64.7%** |
+
+**Cause, measured not guessed.** `GNC_DIAGNOSTICS=1` at q=25: `abac_blocks=280 (empty=0)` per
+plane — **840 code-blocks and not one recognised as empty.** The planes code 9 641 B between them,
+**~11.5 B per block**, against Rice's 3 227 B for the whole picture. **On sparse content abac's
+file is nothing but per-block floor**: every block pays a terminated arithmetic interval plus a
+4-byte length word whether or not it holds a single significant coefficient. `0051`'s cb=32 doubles
+that floor, which is the +9.1% → +64.7% column.
+
+The flip was reverted the same hour. **ENT-14 (P0)** filed with the fix (signal an empty block in a
+bit, as JPEG 2000 signals zero bit-planes: 840 bits is 105 B where 840 empty blocks cost ~9 600)
+and five criteria written before the work.
+
+### Why this is a block and not an edge case
+
+**Every sequence row above is busy content.** Flat frames, fades, title cards, letterbox bars and
+static P-frames are ordinary contribution material, and GOALS says in as many words that *"a static
+studio shot should cost almost nothing"*. **Nobody has run abac on a static shot**, and the gradient
+says what that will find. This is the failure mode GOALS names directly — *a strategy that only
+works at one end and is quietly measured only there* — and the only reason it was caught is that a
+synthetic gradient sits in the regression suite for exactly this purpose.
+
+### Three things rejected, with the reason
+
+- **Widen the gradient baselines.** The baselines are not wrong, the coder is. Moving a ceiling to
+  admit a 41% regression disables the one instrument that caught it.
+- **Per operating point — abac above q=85.** The penalty falls with q, so it is tempting. But the
+  gradient is still **+64.7% at q=90**, inside the range GNC is *for*, so the threshold would have
+  to sit above the range it is meant to serve. The predictor is **content sparsity**, not quality,
+  and a q threshold is a proxy for the wrong variable — the same mistake as `0051`'s expired decode
+  note, one layer down.
+- **Code both per tile and keep the smaller.** It would work and the machinery exists (RATE-2,
+  LOSSLESS-3). Rejected as a *fix*: doubling encode to paper over a defect whose repair is one bit
+  per block. Kept as a fallback if ENT-14 is harder than it looks.
+
+### Also filed
+
+**ENT-13 (P1)**, at the owner's request — abac's remaining cost is structural. It codes every frame
+twice, and the second pass exists only to learn the first one's answer (an arithmetic coder's output
+length is not knowable before coding, and blocks share one output buffer). `BoundedSlots` already
+avoids it and is worth 1.1–1.6x at byte-identical output, but panics if its shader-computed ceiling
+is ever wrong. **The third option nobody has built** — let an overflowing block flag itself and stop
+rather than overrun, then re-code only the flagged blocks — is one pass in the common case with no
+panic ever, and `flags_buf` and `check_flags` are already there.
+
+---
+
+## ENT-10 step 1 — abac was not expensive, it was empty: 1000 threads for a 1080p plane (2026-09-14)
+
+**Machine: Apple M1 Pro, 16 cores, 16 GB, Metal** (`gnc gpu-info`; one of two Macs). Binary
+`codec-fingerprint 6a9fa6bd` before, `fb2fe82a` after. `gnc benchmark -n 5`, idle machine.
+
+### The question came from the owner, and it was the right one
+
+ENT-10 was promoted to P0 under the phase-1 rule — a rate win is worth an encode cost — and the
+first move should have been to flip the default and measure. The owner stopped that:
+
+> *"Vad jag funderar på om vi kan få abac inte så tung först? ... något känns knas med den."*
+
+**Something was.** One diagnostic line, already in the tree: `GNC_DIAGNOSTICS=1` prints
+`abac_blocks=1000` for a 1080p plane. abac's GPU encode runs **one thread per code-block**, so at
+the default cb=64 the entire parallelism of the encode is **1000 threads** — each serially coding
+4 096 coefficients, bit by bit, on a 16-core GPU. Rice runs 256 independent streams *per tile*:
+**10 240 per plane.** The 5x was not the price of arithmetic coding. It was occupancy.
+
+### The measurement
+
+Three stills x q ∈ {90, 99} x cb ∈ {64, 32} x sizing ∈ {CountThenEmit, BoundedSlots}. Bytes are
+identical between sizing modes in **12 of 12** cells, as their documentation promises, so rate is a
+function of `cb` alone.
+
+| | rate vs Rice | encode vs Rice | frame decode vs Rice |
+|---|---|---|---|
+| cb=64 (was default) | −14.1% to −17.5% | **5.0x to 12.0x** | **2.6x to 4.8x** |
+| cb=32 (is now) | −11.8% to −14.9% | **2.2x to 5.1x** | **1.3x to 2.1x** |
+
+**6 of 6 points agree in both directions.** Halving the edge quadruples the block count, and since
+ENT-5 put the *decoder* on the GPU on the same one-thread-per-block rule, it buys both sides:
+**~2.3x off encode, ~2x off decode, for ~2.5 to 3.5 points of rate.**
+
+Controls: **the pixels do not move** (49.89 dB at both cb on bbb q=90, identical to two decimals in
+all three channels — entropy coding is lossless over the same coefficients). And **32 is a knee,
+not a slide**: cb=16 buys ~8% more encode speed for **+17%** rate against cb=64's +3.8%; cb=8 is
+worse on both.
+
+### The ratio column hides the thing a latency question needs
+
+At cb=32/BoundedSlots, 1080p encode is **73.4 ms on bbb and 73.3 ms on stockholm** — the same —
+while Rice moves 39.5 → 15.7 ms with the content. So abac reads "11.96x" on stockholm and "1.86x"
+on bbb **for the same absolute work**; the ratio is mostly a statement about Rice. **abac's encode
+cost is nearly content-independent**, ~73–80 ms per 1080p frame at cb=32 against ~127–199 ms at
+cb=64, and that absolute figure is what a latency budget is spent against.
+
+### Why the old default was 64, and why that reason expired
+
+`DEFAULT_CB`'s doc comment: *"−13.8% rate at 33.0 ms of entropy decode, where cb=32 is −10.9% at
+31.4 ms — cb=64 dominates."* **The rate half still reproduces** (2.9 points then, 2.5–3.5 now).
+**The decode half does not, because the decoder it was measured on no longer exists** — ENT-5 moved
+abac decode onto the GPU, one thread per code-block, which is exactly the axis `cb` controls. A
+33.0 → 31.4 ms reading is a 5% move where today's whole-frame decode moves **2x**; a 5% difference
+cannot be the shadow of a 2x one, and that is how the two are distinguishable as measurements of
+different code.
+
+**This is COORDINATION's "a number carries its codec" in its natural habitat**: a correct
+measurement, recorded as a constant, outliving the thing it measured — and sitting in a `const`'s
+doc comment, where nothing re-runs it and `gnc fingerprint` cannot see it.
+
+### Shipped, and what was declined
+
+`DEFAULT_CB` 64 → **32**. Not a format change: `cb` is written per tile, so a decoder reads what
+the stream says and cb=64 files keep decoding. Decision `docs/decisions/0051`.
+
+**Declined: `BoundedSlots` as the default sizing.** Worth a further **1.1x to 1.6x** at
+byte-identical output, but `CountThenEmit` codes twice and is exact by construction while
+`BoundedSlots` codes once against a shader-computed ceiling and **panics** if that ceiling is ever
+wrong (BUG-22's failure mode). Take the 2.3x that cannot fail before the 1.2x that can; the mode
+stays reachable as `GNC_ABAC_GPU_SIZING=slots` and is now measured rather than merely offered.
+
+**Declined: chasing occupancy further.** cb=16 says that lever is spent. What remains is structural
+— two full coder passes, a readback between them, a `poll(Wait)` per pass — which is ENT-8 and
+PERF-5, and neither is needed to decide ENT-10.
+
+### One test failed, and it was right to
+
+`all_zero_tile_is_cheap` asserted a flat 512-byte ceiling for a 256x256 tile and read 763. An empty
+code-block still costs a terminated interval and a length word, so the floor scales with the block
+count, and the block count scales with `DEFAULT_CB` — 25 blocks became 100. **A correct consequence
+of the change, reading as a regression**, which is what a flat bound on a derived quantity does.
+The assertion is now per block.
+
+### What this does not do
+
+**It does not decide ENT-10.** It moves the cost side: the trade is now **−11.8% to −14.9% at ~2.3x
+encode and ~1.7x decode**, against −14.1% to −17.5% at 5.0–12.0x and 2.6–4.8x. Whether abac becomes
+the default still needs sequences as well as stills and inter as well as intra — `0045` records the
+saving decaying on inter — and its own decision record. **BASELINE's `--abac` rows are now at a
+non-default `cb`**; re-take is MEAS-11, already open.
+
+---
+
+## PERF-4 — the density sweep was not measuring process duplication, and one device for N streams is worse than N devices (2026-09-14)
+
+**Machine: Apple M1 Pro, 16 GB, Metal** — what `gnc gpu-info` printed, not what CLAUDE.md's
+Platform Notes say (see the last section). **Binary: `codec-fingerprint v1 6a9fa6bd`.** All rows
+q=90, `bbb_1080p.png` unless stated, 16 iterations per stream, machine otherwise idle.
+
+### The hypothesis, and why it was the right experiment
+
+PERF-4 came from an external reviewer reading MEAS-5's own numbers: the process sweep flattens at
+1.69x (Mac) / 1.85x (Windows) from N=4 while the GPU draws 2-49 W, each process costs ~1.8 GB and
+~15 s of pipeline compilation. Diagnosis: what flattens is **process duplication**, not the GPU.
+Prescription: one device, one set of pipelines, N submissions in flight, in one process.
+
+It is the right experiment because MEAS-5 Claim B — a bigger GPU buys more GNC streams where it
+buys no more fixed-function encoder blocks — is what GOALS calls the single most important thing
+to measure, and it was being measured by a harness whose N=1 row is dominated by setup.
+
+**Success criterion, set before building:** aggregate throughput against N for a shared-device
+build, same input and q as `--density-still`. If the diagnosis is right, the shared build scales
+past 1.69x.
+
+### What was built
+
+`gnc density` — N encode streams as threads in one process, timed **only** over the steady-state
+window, behind a barrier, after every stream has built its pipelines and encoded a warm-up frame.
+Three arms: one shared device; one device per stream (what N processes do, minus the process);
+`--serial`, the same total frames through one stream, so the aggregate row has a same-binary 1x.
+`scripts/gpu_tier_bench.py --density-inproc` runs the first two and prints a Mpixel/s column.
+Canary: the per-stream table prints each stream's device, pipeline, warm-up and frame count, so a
+run that silently collapsed to one stream is visible.
+
+### Result — the hypothesis is refuted
+
+| arm | N=1 | N=2 | N=4 | N=8 |
+|---|---|---|---|---|
+| one shared device | 21.90 fps | 28.39 (1.30x) | 28.67 (**1.31x**) | 28.39 (1.30x) |
+| one device per stream | 21.69 fps | 27.13 (1.25x) | 34.16 (**1.57x**) | 33.49 (1.54x) |
+| `--serial`, 128 frames one stream | 21.74 fps | | | |
+
+**Removing every per-process cost did not raise the ceiling** — 1.31x against the process sweep's
+1.69x. And **sharing the device is worse than not sharing it.** Reproduced across three sweeps;
+the ratios hold within 0.05 while absolute fps drifted 7% between the first and second run
+(thermal — the ratios are the quotable part, per COORDINATION's timing rule).
+
+### Why sharing is worse, and it is in the tree rather than in the driver
+
+The readback path waits with `device.poll(Maintain::Wait)`, which is **device-wide**: it returns
+when everything submitted on that device has completed, not when the caller's own submission has.
+N streams on one device means each stream's readback waits for all N. ~40 call sites
+(`gpu_util::poll_wait` and callers). Filed as **PERF-5** — `Maintain::WaitForSubmissionIndex`
+threaded from each `queue.submit` — but note the prize: it recovers 1.31x to at best the 1.57x a
+device per stream already gets for free.
+
+### What the ceiling actually is — a pixel rate, measured at three resolutions
+
+A fixed per-frame or per-dispatch overhead flattens in **frames** per second and reads the same at
+every resolution. A GPU throughput limit flattens in **pixels** per second. One device per stream:
+
+| resolution | N=1 fps | ceiling fps | Mpixel/s at the ceiling | N=1 as % of ceiling |
+|---|---|---|---|---|
+| 1280x720 (`kristensara`) | 46.00 | 76.47 (N=4) | **70.5** | 60% |
+| 1920x1080 (`bbb`) | 21.69 | 34.16 (N=4) | **70.8** | 64% |
+| 3840x2160 (`bbb`, resampled) | 7.58 | 10.72 (N=2) | **88.9** | 71% |
+
+The fps ceiling moves 7x across that range; the pixel rate does not. **GNC is throughput-bound at
+~70-90 Mpixel/s on this GPU**, one 1080p stream already uses ~64% of it, and two streams reach it.
+That is the density statement for this machine, and it is about the GPU.
+
+### The harness correction, which is the other half of the finding
+
+`--density-still` on this machine, same frame, same q, same 24 iterations: **N=1 = 7.27 fps**,
+against a true steady-state **23.4 fps**. Its wall clock contains device creation, pipeline build,
+PNG decode, the CPU quality metrics and teardown. **Dividing by an N=1 row that is 3x too slow is
+what produced a scaling column larger than an idealised in-process build can reach**, and its
+1.69x/1.85x/1.98x rows are substantially setup amortisation, not concurrency. They are still the
+right rows for "what does an operator see running N processes" — they are not a concurrency
+measurement, and MEAS-5 should stop reading them as one.
+
+### Two premises that did not reproduce
+
+- **~15 s of pipeline compilation per instance.** With a warm OS shader cache,
+  `EncoderPipeline::new` is **24.8 ms** and device creation **12.9 ms**. The first run after a
+  fresh build took **1 987 ms**. It is a cold-cache first-run cost, not a per-instance one.
+- **~1.8 GB per process.** `gnc benchmark` peaks at **230 MB** RSS at 1080p here; in-process
+  streams cost 164 MB for the first and ~80 MB for each additional (651 MB at N=8). The 1.8 GB is
+  a Windows/Vulkan inter-frame figure and should be re-taken rather than carried.
+
+### Correctness, since concurrency is new
+
+`tests/concurrent_streams.rs`: four streams sharing one device, four rounds each, must each code
+the reference frame to **exactly** the byte count one stream alone produces. A race would show as
+a slightly different coded size, which no throughput number would notice and the fingerprint
+matrix cannot see because it is single-threaded. Passes. `codec-fingerprint` unchanged at
+`6a9fa6bd` across the one encoder edit in this change (a `clippy::nonminimal_bool` simplification
+in `pipeline.rs` that was blocking the gate, exact by inspection and by the fingerprint).
+
+### Would we ship this? What it cost, and what was refused
+
+Shipped: the measurement (`gnc density`, `--density-inproc`), the test, and `docs/decisions/0085`
+rejecting the shared-device architecture. **Refused:** building it. It is more code, it couples
+the streams through a device-wide wait, and its number is already available from N independent
+devices. Process-per-stream stays, and the isolation PERF-4 flagged as possibly a *requirement*
+(crash containment, tenancy) is now free rather than a trade.
+
+### Two things this ran into and did not chase
+
+- **8K does not encode at all.** `bbb_8k.png` wants a 398 MB `enc_raw_input` against the 256 MiB
+  `max_buffer_size` GNC deliberately requests (GOALS rule 4). Filed **BUG-58**. It cost the fourth
+  resolution point above.
+- **This machine is an Apple M1 Pro with 16 GB; CLAUDE.md's Platform Notes say M5 Pro / 20 GPU
+  cores / 64 GB. Asked the owner, answered the same day: there are TWO Macs, and both notes were
+  right.** Nothing in the tree said which machine a row came from, which is BUG-29 one level up —
+  the rule now written into CLAUDE.md and COORDINATION is that a throughput row quotes
+  `gnc gpu-info`. **And the answer hands MEAS-5 a cheap experiment**: the other Mac is a 25%
+  larger GPU already in the owner's hands, so "does a bigger GPU carry more Mpixel/s" is one
+  command on it rather than a discrete NVIDIA card. Filed **MEAS-15 (P1)**, with the three
+  outcomes and what each means written down before the run.
+
+---
+
+## BUG-57 — the bit-exact rung was deleting a tile's residual, and a border tile's mean is 89% padding (2026-09-11)
+
+**Filed by LOSSLESS-5 the same afternoon**, once a Y4M sequence was exact enough end to end for one
+frame in eight to stand out: `bbb.y4m` at q=100 read **75.31 dB** on frame 2 while every other
+frame read `inf`.
+
+### The narrowing, which took five experiments and no guessing
+
+| experiment | result | what it ruled out |
+|---|---|---|
+| error extent | `x 1792..1919, y 1024..1079`, 3 606 samples, max 10 | it is **one tile**, the bottom-right, and its whole visible part |
+| `--tile-size 128` | exact | the tile **grid**, not the content |
+| Rice / abac x GPU / CPU entropy x MED / wavelet | **identical** error, same 3 606, same max 10 | the entropy coder and the transform |
+| encoder reference vs decoder reference, whole padded plane | identical, all three planes, padding included | reference drift |
+| coded MVs vs the encoder's raw i32 MVs, all 40 960 | identical | the motion field and its i32→i16 serialisation |
+
+That left the residual. Dumping the numbers for ten failing pixels settled it in one line: MV
+`(0,0)`, prediction equal to the reference and **correct**, `resid_enc = 1`, `resid_dec = 0`. The
+encoder coded a residual the decoder never saw.
+
+### The cause
+
+`tile_skip_motion.wgsl` declares a tile static when its **mean** per-pixel zero-MV SAD is under
+`qstep/2` and no worse than the motion-compensated error, and the encoder then zeroes that tile's
+quantised coefficients — the decoder reconstructs it from prediction alone. A rate/quality trade,
+running at the rung that has no quality to trade.
+
+**A border tile's mean is a lie in proportion to its padding.** The tile grid pads 1080 up to 1280,
+so at `tile_size=256` the bottom-right tile is 128x56 of picture inside 256x256 — **89% padding**,
+which replicates the picture's edge, is identical frame to frame, and contributes a SAD of exactly
+zero. The mean is diluted ~9x, falls under 0.5, and the real 11% that still differs by ±1 is
+deleted with it. `GNC_SKIP_DIAG=1` on the unfixed encoder: `skip_tiles=1/40` on frame 2, `0/40` on
+its neighbours. At `--tile-size 128` the same corner is 56 of 128 rows and clears the threshold.
+
+**Why nothing caught it.** At q=100 the encoder's reference is the source
+(`reference_from_source`), so the error never enters the next frame and never shows as drift —
+frame 3 was exact again. And before LOSSLESS-5 no Y4M encode was bit-exact end to end, so one
+slightly wrong frame had nothing to stand out against. BASELINE's PNG-sourced lossless rows were
+honest for a duller reason: on that content the corner tile never falls under the threshold.
+
+### The fix, and the alternative that was measured and refused
+
+Do not zero coefficients when `config.is_lossless()`. `GNC_TILE_SKIP_THRESH` is refused there too,
+with a canary. Decision record `0084`.
+
+**Turning the whole pass off at lossless was the tidier statement and is rate-neutral, so it was
+not taken.** The MV forcing's stated purpose is to make the residual small *so the quantiser zeroes
+it*, and at step 1.0 the quantiser zeroes nothing — the mechanism is gone even though the code
+runs. But measured on six points (bbb at 4:2:0 / 4:2:2 / 4:4:4, ki=8 and ki=2, 8 frames) the
+difference is **−0.009%, −0.005%, +0.011%, +0.006%, −0.004%, +0.000%** — sign varying, every figure
+under 0.011%. Nothing to collect, so the diff stays at the one line that is wrong.
+
+### After
+
+**Every frame of every clip, in every chroma format, at both keyframe intervals, is bit-exact** —
+which is LOSSLESS-5's success criterion with no exception left in it:
+
+| clip | format | ki=8 | ki=2 | frames |
+|---|---|---|---|---|
+| bbb | 4:2:0 | 11 871 842 | 12 291 502 | 1I+7P / 4I+4P |
+| blue_sky | 4:2:0 | 10 378 585 | 10 378 585 | 8I |
+| crowd_run | 4:2:0 | 16 679 183 | 16 679 183 | 8I |
+| old_town_cross | 4:2:0 | 15 952 107 | 15 952 107 | 8I |
+| bbb | 4:2:2 | 13 448 505 | 13 975 917 | 1I+7P / 4I+4P |
+| bbb | 4:4:4 | 17 789 345 | 17 977 284 | 1I+7P / 4I+4P |
+
+Cost: **+0.057% to +0.108%**, and only on bbb — the three camera clips code all-intra at q=100
+(`0070`) and are byte-identical.
+
+**The RGB / PNG path does not move at all.** 144 `encode-sequence` runs md5'd against the pre-fix
+binary — four clips x {q=50, 75, 100} x {4:4:4, 4:2:0, 4:2:2} x {Rice, abac} x {ki=2, ki=9} —
+**byte-identical, q=100 included**.
+
+### Two things about the regression test, because both were got wrong first
+
+`tests/lossless_tile_skip.rs` reproduces the geometry at 320x300 (padded 512x512, so the corner
+tile is 4.3% picture) and fails against the unfixed encoder with *2 709 samples wrong over
+x 256..318, y 256..298*. Getting it to fail took two corrections, and each is a fact about the
+mechanism:
+
+1. **The change must stop before the last row and column.** Padding replicates the picture's edge,
+   so an edge that moves makes the padding move with it and the tile's mean stops being a lie.
+2. **The change must be one no motion vector can predict.** The first version alternated a
+   checkerboard, `(i + j + f) % 2` — which is the previous frame shifted one pixel, so the search
+   found it, `mean_mc` collapsed, and the shader's second condition correctly refused the skip. A
+   uniform per-frame offset over the interior is invisible to the search.
+
+**And the instrument had the same defect as the code.** `GNC_SKIP_DIAG`'s buffer copy sat *inside*
+the block the fix gates, so with the zeroing off it copied nothing and the readback reported a
+stale `skip_tiles=0` — on the real clip, after the fix, while the diagnosis was being written. It
+now reports what the pass decided either way, and says when the coefficients were kept.
+
+---
+
+## LOSSLESS-5 — a Y'CbCr sequence codes as itself, and the chroma motion vectors were half-pel all along (2026-09-11)
+
+**What was open.** LOSSLESS-4 gave the still path a native Y'CbCr arm; the sequence path did not
+have one. The previous session landed the plumbing — `preprocess_to_planes` with a
+`convert_colour` flag threaded through all eleven sites — and recorded, honestly, that the native
+arm still produced a worst sample error of **258** on a 0-255 scale and left both requirements as
+`#[ignore]`d tests.
+
+### The cause was one call site, and it was in the still path
+
+Four isolation runs on one 256x256 frame, encoder arm x decoder arm:
+
+| | worst sample error |
+|---|---|
+| sequence encode, sequence decode | 258 |
+| sequence encode, single-frame decode | 258 |
+| **single-frame encode, single-frame decode** | **258** |
+| single-frame encode, sequence decode | 258 |
+
+All four, which rules the sequence path out entirely: `encode()` with
+`color_space = YCbCrNative` was already wrong before any of this. `EncodeInput::Rgb` names the
+*layout* — interleaved triples — and was being read as naming the *colour space*, so `encode_once`
+ran the YCoCg-R matrix unconditionally while the decoder, correct since GP21, ran no inverse. The
+sequence encoder's own eleven sites all branched correctly; its I-frames simply do not go through
+them, they go through `encode` / `encode_as_reference`.
+
+`encode_once` now calls `preprocess_to_planes` — the same function, the same decision, one copy.
+All four arms read **0**, and the frame got 55% smaller on that synthetic (86 185 -> 38 799 B),
+which is the colour transform no longer being applied to samples that did not want it.
+
+### Then the chroma motion vectors, which is the real find
+
+With the colour space fixed, `bbb.y4m` at q=100 4:2:0 decoded **bit-exact on I-frames and
+66.5-70.4 dB on every P-frame**, the error entirely in Cb and Cr. Cause: BUG-39 rounds luma
+vectors to full-pel because a step-1.0 quantiser cannot survive a fractional prediction —
+and `motion_mv_scale.wgsl` then **halves** that vector for chroma. A multiple of 4 quarter-pels
+becomes a multiple of 2. Half-pel. `bilinear_ref` averages two reference samples, the prediction
+is fractional again, and the quantiser rounds it. The same defect the rounding exists to prevent,
+one subsampling factor over.
+
+It could not be seen before. Through the RGB path a Y4M's own samples can never come back at all
+(the BT.601 matrix is not integer-invertible, and BUG-45 rounds the fractional input), so
+"P-frames are not bit-exact at 4:2:0" read as that already-known loss.
+
+**The fix is on the luma vector, not the chroma one.** Rounding the encoder's `mv_chroma_buf`
+after the scale was tried first and is wrong: the decoder halves whatever the bitstream carries
+and does no rounding of its own, so the two drift — measured, 55.6 dB on the first P-frame falling
+to **46.4 dB** by the eighth. Making the luma vector a multiple of 8 quarter-pels instead means it
+arrives as a multiple of 4 on *both* sides. No decoder change, no bitstream generation. Per axis,
+so 4:2:2 gets (8, 4) and 4:4:4 keeps (4, 4).
+
+`bbb.y4m`, q=100, 8 frames, ki=8, worst-frame PSNR:
+
+| | before | after | bytes |
+|---|---|---|---|
+| 4:2:0 | 66.47 dB (7 of 7 P-frames inexact) | **inf on 7 of 8 frames** | 12 002 673 -> 11 863 639 (**−1.16%**) |
+| 4:2:2 | 7 of 8 frames inexact | **inf on 7 of 8** | 13 830 698 -> 13 440 827 (**−2.82%**) |
+| 4:4:4 | unchanged (quantum stays 4) | inf on 7 of 8 | 17 773 215 |
+
+The coarser vectors *save* rate here because the MV field costs less and the residual does not
+get worse on this content. That is not general — see the cost below.
+
+### The rate, with both arms at the source's own chroma format
+
+`benchmark-sequence -q 100`, 8 frames, native against `GNC_RGB_PATH=1 --chroma-format 420`, which
+is the arm that isolates the **colour space alone** (the 2026-09-11 correction: comparing against
+a 4:4:4 RGB encode credits a chroma-format change to the colour space).
+
+| clip (4:2:0) | ki | native B | RGB B | delta |
+|---|---|---|---|---|
+| bbb | 8 | 11 863 639 | 13 949 160 | **−14.95%** |
+| blue_sky | 8 | 10 378 585 | 12 177 781 | **−14.77%** |
+| crowd_run | 8 | 16 679 183 | 18 596 938 | **−10.31%** |
+| old_town_cross | 8 | 15 952 107 | 17 940 092 | **−11.08%** |
+| **sum** | 8 | 54 873 514 | 62 663 971 | **−12.43%** |
+| **sum** | 2 | 55 290 846 | 63 464 162 | **−12.88%** |
+
+Four of four, at two keyframe intervals, and it lands where the corrected still-path figure said
+it would: **−13.2%**. The `−39%`/`−40.6%` headlines remain superseded.
+
+On bbb's converted clips, where both arms are at the file's own format: 4:2:2 13 440 827 against
+16 978 198 (**−20.8%**) and 4:4:4 17 773 215 against 24 084 895 (**−26.2%**). Both are larger than
+−13% because the RGB arm codes those all-intra — LOSSLESS-2 throws its P-frames out — so they mix
+a colour-space delta with a frame-type one. The 4:2:0 table above is the clean comparison.
+
+**And the quality half is not a trade.** At q=100 the native arm returns the source's own samples;
+the RGB arm returns a picture BT.601 produced from them, exactly (4:4:4) or with subsampling loss
+(4:2:0 / 4:2:2, PSNR 38.6 dB against its own RGB). There is nothing to weigh: one arm is the file
+and the other is a conversion of it.
+
+### What it cost, and where
+
+Making the luma vector a multiple of two pixels costs prediction accuracy at 4:2:0 and 4:2:2.
+With `GNC_LOSSLESS_INTRA_RECODE=0` so P-frames are kept whatever they cost, PNG source, q=100,
+4 frames, 4:2:0:
+
+| clip | before | after | delta |
+|---|---|---|---|
+| bbb | 7 137 373 | 7 177 025 | +0.56% |
+| blue_sky | 7 827 417 | 8 051 957 | +2.87% |
+| crowd_run | 11 489 766 | 11 809 723 | +2.79% |
+| old_town_cross | 11 140 956 | 11 376 531 | +2.11% |
+
+**In shipped configuration that cost is not paid.** LOSSLESS-2 re-codes a lossless P-frame that
+costs more than an I-frame, and on all three camera clips it throws every P-frame out at q=100
+anyway; on bbb, the one clip that keeps them, the change is **−1.16%**. So the measured shipped
+effect across four clips is −1.16%, 0.00%, 0.00%, 0.00%. The +2.9% is what the measurement arm
+pays, and it is in the record because a future change to LOSSLESS-2's rule would start paying it.
+
+It also fixes the RGB path, which had the same defect invisibly: PNG source, 4:2:0, q=100,
+P-frames forced, per-frame PSNR goes **38.60 -> 38.63 dB**, exactly the I-frame's figure. The
+residual P-frame-only loss is gone; what remains is the chroma subsampling of an RGB source,
+which is not this item's to fix.
+
+### The RGB path did not move anywhere else
+
+144 encode-sequence runs md5'd against a binary built from `c633cc4`: four clips x {q=50, q=100} x
+{4:4:4, 4:2:0, 4:2:2} x {default, abac, rice} x {B-pyramid on, off}, ki=2, 4 frames.
+**132 byte-identical.** The 12 that moved are bbb at q=100 at 4:2:0 and 4:2:2 — the exact arm the
+MV quantum targets, and the only clip whose P-frames survive q=100.
+
+### What is still wrong, and it is not this item
+
+**BUG-57.** One frame in eight of `bbb.y4m` is not bit-exact: frame 2, **3 606 luma samples**, max
+error 10, all inside the bottom-right tile starting at (1797, 1024) — the corner tile, which is
+mostly padding. Same frame and same region at 4:4:4 (where all three planes are affected) and at
+4:2:2. It **disappears at `--tile-size 128`**, it is deterministic across runs, and it does not
+propagate: frame 3 is exact again. That is an encoder/decoder disagreement confined to one frame's
+own reconstruction, not reference drift, and it is a separate defect from anything LOSSLESS-5
+touched — it is simply the first time a sequence was exact enough for one frame in eight to stand
+out. Filed with the repro.
+
+### What was deliberately not done
+
+The sequence CLI turns the native arm on **only for a lossless request**, unlike the still path
+which takes it at every q. Below q=100 the change is a rate/quality trade in a different colour
+space — the subband weights and the CfL range were tuned on YCoCg-R, VMAF cannot see the chroma
+half of what moves, and a luma PSNR computed in two different spaces is not a comparison. That
+measurement has not been made, so the lossy default stays where it was. **LOSSLESS-6.**
+
+### Three test-content failures worth recording, because each said something
+
+The `Predicted` assertion in `lossless5_native_video.rs` rejected three synthetics before one
+passed, and none of the rejections was about the colour space:
+
+1. Noise reseeded per frame — motion compensation had nothing to find.
+2. Positional noise on a smooth ramp — MED intra-coded it so cheaply that LOSSLESS-2 re-coded
+   every P-frame as I.
+3. At 4:2:0, *any* whole-frame pan by an odd number of pixels — with the vectors now rounded to
+   two pixels the prediction is off by one everywhere, and LOSSLESS-2 correctly throws the
+   P-frame out. Measured at every odd step from 1 to 5.
+
+The content that works is blocks plus texture for 4:4:4, and a **static background with one moving
+band** for 4:2:0 — the still part earns the P-frame and the band carries the odd vectors. Against
+the pre-fix encoder that third test reads a worst error of **0.5** with 236-256 of 256 vectors not
+multiples of 8, so it discriminates rather than merely passes.
+
+---
+
+## MEAS-12 — every sequence throughput figure was understated 2.3x to 3.5x, and 29 of 65 ms per frame is not coding (2026-09-08)
+
+**Why this was run.** The project owner observed that GNC has "massive performance issues", and the
+figure behind that is BASELINE's **5.0 fps end to end** against a 60 fps target. But 5.0 fps
+disagreed with a number taken an hour earlier in the same quiet hour: single-frame encode is
+15.34 ms, i.e. 65 fps. **A frame cannot cost 15 ms alone and 200 ms in a sequence** — P-frames carry
+less residual than I-frames, so the sequence figure should be *cheaper* per frame, not 13x dearer.
+That discrepancy is the hypothesis: the 5.0 fps is an artefact.
+
+**It is.** Same parameters as BASELINE's A/B/C table — 1080p, 8 frames, `--keyframe-interval 8`,
+q=75, Rice — median of 3, idle machine, `e190ce4`:
+
+| quantity | what it times | 2026-09-06, shared | **2026-09-08, idle** | factor |
+|---|---|---|---|---|
+| **A** | `benchmark-sequence`, Y4M in | 12.2 fps | **27.8 fps** | **2.3x** |
+| **B** | the figure `encode-sequence` prints | 5.6 fps | **19.4 fps** | **3.5x** |
+| **C** | wall clock around `encode-sequence`, PNG in | 5.0 fps | **15.4 fps** | **3.1x** |
+
+So the headline performance number was understated by 3.1x, and **A is 1.8x C**, not the 2.4x this
+table recorded.
+
+**`--throughput` is not what fixed it, and that is worth stating because it was my hypothesis.**
+BUG-32 found `benchmark-sequence` spending 86% of its wall clock on CPU PSNR/SSIM, and I expected
+that to be most of quantity A. It is not: with `--throughput` A reads 288.1 ms and without it the
+same run reads 291.0 ms — **under 1%.** The metrics were always *outside* the encode timer, so
+BUG-32's finding applies to the command's wall clock and to `gpu_tier_bench --density`, which
+divided frames by that wall clock, but **not to this table's figures.** The whole 2.3–3.5x is the
+machine.
+
+### The decomposition, which is the part worth keeping
+
+Per frame, from the three quantities: GPU encode phase **36 ms**, encoder loop **51 ms**, end to
+end **65 ms**. So **29 of the 65 ms is not GPU coding work** — 15 ms of host-side encoder loop and
+14 ms of PNG decode, container writing and process startup.
+
+**And an independent check that the end-to-end figure is host-bound, not coding-bound:** quantity C
+reads **15.41 fps at 4:4:4 and 15.61 fps at 4:2:0**. Doubling the chroma sample count costs **1%**.
+A coding-bound pipeline cannot do that. (Noted on the way past: `encode-sequence --chroma-format`
+defaults to **444** while the Y4M path is 4:2:0, so BASELINE's A and C were never coding the same
+chroma either — it turns out not to matter, but the table did not say so.)
+
+Against the 60 fps target (16.7 ms/frame) **the GPU phase alone is 2.2x short**, so this is not
+"the performance problem was imaginary". It is two problems of comparable size, and only one of
+them is the codec.
+
+### What this does to the record
+
+Four documents carried 12.2 / 5.0 and now carry 27.8 / 15.4: BASELINE's A/B/C table, GOALS §3's
+known-gaps bullet and §4's encode-speed row, and README's two throughput sites. **Nothing about the
+codec changed** — this is the fifth quantity re-taken in one quiet hour, after MEAS-6's ~80 ms → 25.2 ms,
+ENT-10's abac ratios, PERF-3's slice and MEAS-5's density, and it moved by about as much as the
+others.
+
+**The pattern is now the finding.** Five figures, all measured on a machine shared by eight
+sessions, all understated by 1.5x to 3.5x, and the two largest errors were in the two numbers the
+project quotes most: its latency and its throughput. BASELINE's own rule said timing runs require
+an idle machine and estimated the penalty at 20%; the real penalty was up to **3.5x**. That rule
+should say so.
+
+---
+
+## The quiet hour: five parked items collected, and `0017`'s decode debt is twice what it says (2026-09-08)
+
+The project owner stopped the other sessions. `QUIET_HOUR.md`'s five-check gate passed —
+`scripts/claim list` reported **0 distinct live sessions**, no `cargo`/`rustc`/`x264`/`ffmpeg`/
+`python` process, load average 1.63 with a 15-minute figure of 10.20 (the machine had just
+settled). All figures below are **median of 3 or more** at `19354a4`,
+`codec-fingerprint v1 9e2b1202`, Apple M5 Pro / Metal, `bbb_1080p.png` (`f83f355f…`).
+
+**Instrument note that governs everything here: `benchmark`'s decode jitter is absolute, not
+proportional — about ±0.5 ms.** Rice decode varies 1.13–1.14× run to run (9.82–11.07 over six
+runs); abac decode, being 3× longer, varies 1.02×. So a Rice-side whole-frame difference under
+~6% is not a result at n=3, and a ratio with Rice in the denominator carries that spread. This is
+not load: it reproduced with the machine idle.
+
+### Run 1 — ENT-10: the encode reason reproduces, the decode reason does not
+
+| | Rice | abac | ratio | `0017` records |
+|---|---|---|---|---|
+| frame decode | 10.25 ms | 32.69 ms | **3.19×** | **1.69×** |
+| frame encode | 15.16 ms | 84.40 ms | **5.57×** | 129/23 = **5.61×** |
+
+Spread: abac 1.02×, Rice 1.14×. `abac_bench`'s grid read `med/best 1.01×` on every row, which the
+harness itself defines as settled.
+
+**So reason 2 of `0017` survives as a ratio and its absolute number is explained.** 129 ms was
+never the shipped path: the grid reads **CPU Interval at 127.15 ms/frame** against the shipped
+**GPU Range/BoundedSlots at 50.87 ms/frame**. The ratio to Rice, though, is 5.57× today against
+5.61× then — reason 2 is *not* discharged, and encode is now the larger of the two debts.
+
+**Reason 1 does not reproduce, and it is the reason the decision rests on.** 1.65× was measured on
+an *idle* machine on 2026-09-06, so load does not explain a move to 3.19×.
+
+**Attributed as far as one A/B goes: ENT-9 is ~a tenth of it, and its cost was never logged.**
+ENT-9 has no env switch (GP18→GP19, older abac frames are refused), so the arm is a build of
+`a05dc7c^`:
+
+| | pre-ENT-9 (`f871a33`) | HEAD | ENT-9's cost |
+|---|---|---|---|
+| abac decode | 29.86 ms | 32.69 ms | **+9.5%** |
+| abac encode | 76.73 ms | 84.40 ms | **+10.0%** |
+
+ENT-9 bought −2.07% to −8.76% of rate for ~10% both ways. That is a defensible trade and it is
+now on the record — but **GOALS §5 consequence 2 requires the cost to be logged with the win**,
+and ENT-9's commit verifies bit-exactness on 6 of 6 arms without a millisecond in it.
+
+**Pre-ENT-9 abac is still 2.91×, so 1.65× → 2.91× is unattributed.** Candidates, none measured:
+ENT-5's GPU decode, ABAC-SHIP, `0031`, `0032`, ENT-8 step 1. That bisect is the remaining work.
+
+**What this does to ENT-10.** The cost side is roughly double what the decision record says, and it
+grows with every abac improvement. The rate side is +89.2% → +66.0% BD-rate but decays to −3.7% on
+inter at q=99, GNC's own range (`0045`). Nothing here settles the item; it replaces a stale number
+with a measured one, which is what it was parked for.
+
+### Run 2 — MEAS-6: ~80 ms was load, and the controlled cross-machine comparison now exists
+
+`scripts/gpu_tier_bench.py --tier`, the same harness and default (`--quality` 90) as the RTX row,
+on the same pinned input:
+
+| | encode | decode | round trip |
+|---|---|---|---|
+| **Apple M5 Pro (Metal), idle, today** | **15.34 ms** (65.2 fps) | **9.87 ms** (101.3 fps) | **25.2 ms** |
+| RTX 4000 Ada (Vulkan), 2026-09-07 | 13.95 ms | 7.29 ms | 21.2 ms |
+| Mac, MEAS-6 2026-09-06, non-idle | ~47 ms | ~35 ms | ~80 ms |
+
+Settle 1.01 / 1.03. **GNC's default round trip is 25.2 ms, not ~80 ms** — the earlier figure was
+about 3.2× inflated by a shared machine, exactly as BASELINE's 20% rule warned and worse than it
+predicted.
+
+**And BASELINE's named-missing control is no longer missing.** It said: *"The controlled version is
+one command — this same harness on an idle Mac — and it has not been run."* Run. The Mac is
+**1.19× slower than the RTX 4000 Ada**, not the 3.8× the uncontrolled rows would have implied.
+
+Two consequences. GOALS §4's latency row said ~80 ms is "four frames short" of the 20 ms
+sub-frame target at 50 fps; at 25.2 ms it is **1.26 frames**, essentially at target. And the
+structural half is unaffected — 0 frames of reordering (`0033`) was never a timing measurement.
+
+### Run 3 — PERF-3 item 8: the Rice stage is not load-bound, so items 9–11 are mispriced
+
+`GNC_RICE_DISPATCH_REPEAT=k` isolates the slice as `(t(k)−t(1))/(k−1)`, k ∈ {1, 8}, n=3 per cell,
+against a build of item 8's parent (`ff6276d`):
+
+| | frame decode | isolated Rice slice | slice share |
+|---|---|---|---|
+| item 8 **in** (HEAD) | 10.27 ms | **4.730 ms** | 46% |
+| item 8 **out** (`ff6276d`) | 10.87 ms | **4.737 ms** | 44% |
+
+**Item 8 moves the isolated slice by −0.15%.** It removed 3 of every 4 storage loads from the Rice
+inner loop and the stage did not notice. Two things follow:
+
+1. **The item's own instruction applies: revert it.** *"If it measures neutral or worse, revert it;
+   the diff is one shader and bit-exactness makes a revert free."* Not done here — filed as the
+   item's next step, because a revert is a code change and this hour was for measurement.
+2. **Items 9, 10 and 11 are each priced on bytes of bus traffic saved, and the stage that dominates
+   decode is not bus-bound.** One A/B of a change that already existed answers for three that do
+   not. They should be re-priced or closed rather than built.
+
+**The whole-frame column is deliberately not quoted as a −5.5% win.** It looks like one, and it is
+not: HEAD's own k=1 spread is 1.13× over six runs (9.82–11.07), which brackets the difference.
+A change confined to the Rice inner loop cannot speed up the rest of frame decode, so a neutral
+slice plus a −5.5% frame is incoherent, and the slice is the instrument whose noise divides by 7.
+**Independent confirmation on the way past:** the slice is 46% and 44% of frame decode, against
+GOALS' recorded 47% for the entropy stage.
+
+### Run 4 — MEAS-5: no session cap on a third machine, and the first fixed-function row on this one
+
+`--density-still`, q=90, 24 iterations per instance:
+
+| instances | completed | aggregate fps | scaling |
+|---|---|---|---|
+| 1 | 1/1 | 23.38 | 1.00× |
+| 2 | 2/2 | 36.12 | 1.55× |
+| 4 | 4/4 | 39.58 | **1.69×** |
+| 8 | 8/8 | 39.53 | **1.69×** |
+
+**8 of 8 complete — no session cap, no driver limit.** That is Claim A on a third machine, and it
+is what this harness exists to detect: the laptop round's 0/8 printed as a session cap and was a
+harness defect. **GNC saturates the M5 Pro's 20 GPU cores at N≈4, at 1.69× aggregate.**
+
+**And then the uncomfortable row.** `--hwenc` against the machine's own fixed-function encoder:
+
+| instances | completed | aggregate fps | scaling |
+|---|---|---|---|
+| 1 | 1/1 | 237.35 | 1.00× |
+| 8 | 8/8 | **2288.15** | **9.64×** |
+
+VideoToolbox scales **9.64× where GNC scales 1.69×**, has **no session cap either** (8/8), and
+reaches ~58× GNC's aggregate throughput. That is the opposite direction to GOALS §1's structural
+argument, which predicts a fixed-function ceiling and unbounded compute scaling.
+
+**This does not settle Claim B and must not be quoted as if it did.** Three reasons, and the third
+is disqualifying on its own:
+
+- **Not quality-matched.** VideoToolbox at q 18 against GNC at q=90 — different rate, different
+  distortion. The harness prints this warning itself.
+- **Not the same quantity.** GNC's rows are `--density-still`, one still frame looped, **intra by
+  construction**; the VideoToolbox rows are an 8-frame clip through ffmpeg at g=9.
+- **The absolute numbers are incoherent at this clip length.** N=1 takes 0.5 s of wall clock and
+  N=2 takes 0.2 s — more work in less time. At 8 frames the per-process startup dominates and the
+  fps column is not measuring encoding.
+
+So what this run establishes is Claim A on a third machine, a real saturation point for GNC, and
+**a red flag against Claim B that is worth more than the number attached to it**: the first
+fixed-function comparison on this hardware points the wrong way, and the project's headline
+positioning should not be strengthened until it is done properly — quality-matched, same quantity,
+on a clip long enough that startup amortises.
+
+### Run 5 — BUG-38: 63 files, and the precondition was a false positive
+
+`cargo fmt`, 63 files, +3895/−2235, behaviour-neutral. Gates on the landed tree: **279 tests
+passed, 0 failed**; both clippy targets clean.
+
+The precondition `0066` wrote was "every worktree is clean", and `claim list` was reporting one
+uncommitted file in `gnc-rebaseline` for four hours. It is `?? meas10_out/`, an untracked results
+directory from MEAS-10 — not source, and nothing `cargo fmt` can touch. **The gate as written
+counts untracked output directories and would have blocked this item indefinitely.**
+`QUIET_HOUR.md`'s check 2 now counts tracked modifications only.
+
+### What the hour did not do
+
+`ENT-8` step 2 is parked on the same precondition but is ENT-5-scale implementation, not a
+measurement. Glass-to-glass still needs capture hardware. `MEAS-5`'s Claim B still needs a
+discrete NVIDIA card with driver 610+/nvenc 13.1, and the laptop round still owes the first real
+DX12 measurement (unblocked by BUG-40, never re-run) — `docs/GPU_TIER_TEST.md`.
+
+---
+
+## BUG-48 — the padding fill follows the candidate that is kept, not the quality number (2026-09-08)
+
+**What was open.** LOSSLESS-3 found `quality_preset(100)` keeping PAD-1's decay padding fill and
+measured −0.66% to −0.78% on two stills. The item asked for the four stills `0039` used, at q=100
+*and* through RATE-2's candidate at q=95..99, before touching the preset.
+
+**Domain declaration.** Coded bytes of stills and sequences. A bitstream change for bit-exact
+pictures; nothing else moves.
+
+**Harness** `scripts/meas_bug48_pad_fill.py`, fingerprint-stamped (`700d5f8a` before, `9e2b1202`
+after — the tool from COORD-6 doing its job on its first outside use).
+
+### The measurement refuted the proposed fix, and named the real rule
+
+Shipped against forced `decay`, four stills:
+
+| | bbb | blue_sky | kristensara | touchdown | mean |
+|---|---|---|---|---|---|
+| q=95 | 0.00% | 0.00% | 0.00% | 0.00% | **0.00%** |
+| q=97 | 0.00% | −0.64% | −0.39% | −0.64% | **−0.42%** |
+| q=99 | −0.66% | −0.64% | −0.39% | −0.64% | **−0.58%** |
+| q=100 | −0.66% | −0.64% | −0.39% | −0.64% | **−0.58%** |
+
+**No point worse anywhere. Sequences byte-identical, 8 of 8**, against the actual pre-fix binary at
+q ∈ {95, 99, 100} × ki ∈ {2, 9} on bbb and crowd_run.
+
+**The lever reverses with the candidate, not with `q`.** At a bit-exact setting the padding is coded
+*exactly*, so a fade to flat is spent on where replication is predicted for free; where the lossy
+wavelet candidate is kept, the fade suppresses ringing and `0039` is simply right — forced
+replicate costs **+4.86% at q=95**. q=97 shows both signs in one column: bbb still keeps the lossy
+candidate and pays **+6.26%**, the other three have switched to bit-exact and gain 0.4–0.6%.
+
+So the fix is not `quality_preset(100).pad_fill_decay = false`, which would leave every bit-exact
+*candidate* RATE-2 codes at q=95..99 paying the fade — the case the item said compounds. It is
+`is_lossless_intent()` in the preset **plus** forcing `false` in `lossless_sibling`, which also
+**supersedes BUG-47's inheritance** with the same guarantee reached a stronger way: forcing cannot
+disagree with anything, because the sequence path already clears the flag for every keyframe. The
+RATE-4 byte-identity gate still passes 24 of 24 with the route firing 78 times.
+
+### The false alarm, which is the transferable part
+
+The first version of the harness used `GNC_PAD_FILL=decay` as the before-arm for sequences and
+reported this change as a **−7.21% regression on bbb**. It is not a before-arm: that knob *also*
+overrides the sequence encoder's deliberate keyframe clear, which PAD-1 chose on worst-frame PSNR
+(up to 4.03 dB on bbb_extended). Settled by building the actual pre-fix binary — 8 of 8
+byte-identical — rather than by reasoning about the knob.
+
+**A knob that does more than the change under test is not a control arm**, and this one failed in
+the expensive direction: it read as a plausible regression rather than as an error. The harness now
+compares sequences against `replicate` and says why in as many words.
+
+**Also found on the way:** `scripts/meas_rate3.py` can no longer parse crowd_run at q=95, because
+LOSSLESS-3 (`0073`) now ships that sequence **all-intra** and its P-frame regex finds nothing. Not
+caused by this change — verified identical with and without it — and left to that harness's owner
+rather than edited.
+
+**Gates:** `cargo test --release` **275 passed, 0 failed**; both clippy targets clean. Decision
+`docs/decisions/0079`.
+
+---
+
+
+## BUG-51 — `GP19` is claimed twice, and the namespace where that corrupts data had no guard (2026-09-08)
+
+**How it was found.** Not by looking. A peer session, having inherited the orphaned `gnc-tile1`
+worktree (COORD-8), mentioned in passing that its uncommitted work "carries a GP18→GP19 bitstream
+bump". ENT-9 had taken **GP19** for abac's context-coded prefix an hour earlier. Verified in both
+trees rather than assumed:
+
+- `main`: `b"GP19" => 19`, and the entropy-type-5 gate is `gen >= 19` (`0074`).
+- `gnc-tile1`, uncommitted, based on `a73e0a2`: `b"GP19" => 19`, *"TILE-1 stage 1 — plane padded
+  to 32, not to tile_size"*.
+
+**This is the `0018` mechanism in the one namespace where it corrupts data rather than annoying
+someone.** A duplicated decision number is a documentation nuisance; a duplicated item id is a
+queue nuisance (COORD-3); a duplicated *generation* means **a file at GP19 can be either format
+while `deserialize_compressed_validated`'s `gen >= N` gates are right for only one of them.**
+`0074` had already written the failure mode down for exactly this pair of binarisations: they
+differ only in how bits are modelled, so misreading one as the other gives a **plausible wrong
+image rather than an error**. Filed P1 where COORD-3 was P2, for that reason alone.
+
+**The trap is that a clean textual resolution hides it.** Merging `main` into tile1 conflicts in
+`src/format.rs`; keeping either side alone looks like a resolution and leaves the semantic clash
+intact. TILE-1's padding needs GP20, its own table entry and its own gate.
+
+**Guard landed, race not closed, and the split is deliberate.** `tests/bitstream_generation.rs`
+asserts two things over the table in `deserialize_compressed_validated`, which is the single
+source: no generation number is claimed by two magics, and the magic `serialize_compressed` stamps
+is the newest generation in the table. **Mutation-tested both ways** — injecting a second arm at
+19 reproduces the real message (`two magics claim one generation: [(19, ["GP19", "GP1X"])]`), and
+bumping the writer without a table entry fails the second test. What it buys is that the collision
+**fails at `cargo test` instead of at a merge**. What it does not buy is exclusion: two sessions
+can still both read `format.rs` and pick the next number, which is precisely how `0018`, `0024`
+and `0027` happened. That wants the allocator the other three namespaces now have (`claim gen`
+beside `claim dr` / `claim bug` / `claim id`, per `0050` and `0065`), and it is still open.
+
+**The renumber is not done and is not mine to do** — it is another session's worktree and its owner
+is mid-debug in it. Flagged to them directly, with one thing worth repeating here: their
+`full_pipeline_rice_roundtrip` reads **4.95 dB at 1920x1088** against 56.21 dB at 256x256, which is
+the border-tile bug TILE-1 exists to fix, but it was taken on a tree whose `format.rs` disagrees
+with `main` about what GP19 means. Re-take it after the renumber rather than debug two faults as
+one.
+
+**The general lesson, and it is about scope rather than about ids.** `0050` and `0065` closed the
+decision-number and item-id namespaces and both records framed the problem as "ids". Neither asked
+**which other numbers in this repository are picked by reading a file and adding one** — and the
+answer included the bitstream generation, the only one of the three whose collision produces a
+wrong picture instead of a wrong label. When a fix is framed as closing a class, enumerate the
+class.
+
+**Gates.** `cargo test --release --test bitstream_generation`: 2 passed, and both fail on the
+mutations above. Full suite on the merged tree before this test was added: **274 passed, 0 failed,
+9 ignored**; `cargo clippy --release --all-targets` and wasm `--lib` clean; `claim selftest`
+passes. No codec behaviour changed — this adds a test and one BACKLOG entry.
+
+---
+
+## COORD-8 — the orphan count is arithmetic, and the obvious oracle was unsound (2026-09-08)
+
+**What was open.** `0069` reported the holder's worktree when liveness could not be tested, which
+made an untestable claim actionable. It still said *"verify before trusting"* **without saying
+how**, and `0071` had removed one cause without answering the question. A peer session raised the
+gap and supplied the correction, which is the part worth recording.
+
+**`pgrep -x claude` is unsound for this.** It omitted a live session whose own
+`ps -o comm= -p 8815` reads `claude` — this session, absent from `pgrep -x claude` output taken
+minutes earlier, reproducibly. The peer hit it independently and **nearly concluded four holders
+were gone from a listing that had missed itself.** `kill -0` plus `ps -o comm=` is sound, which is
+what `session_alive` already does, so the fix was never in the pid test — it was in what the
+listing tells you to do next.
+
+**The row-by-row question is unanswerable and the aggregate is not.** Measured on the day:
+
+| | |
+|---|---|
+| worktree claims | 17 |
+| held by a live, testable session | **8 distinct sessions** |
+| identity cannot be tested | 6 |
+| live sessions in this repo (`ListAgents`; socket registry agreed 16/16, every pid alive) | **9** |
+
+9 − 8 = **one live session unaccounted for**, so **at least 5 of the 6 untestable claims are
+orphaned** and at most one is real. Claim age narrows which: all six are over two hours old, so a
+session started an hour ago cannot own one.
+
+**That is deliberately weaker than the reading it replaced.** The peer's summary was "almost
+certainly gone" for four holders; the arithmetic supports at least five of six, not six of six,
+and does not say which five. **Four steals on an inference is the move today has punished twice**
+(BUG-41/BUG-42's triple filing, and the aborted merge), so the bound is reported and nothing is
+taken.
+
+**The instrument got its own arithmetic wrong first, and using it is what caught that.** The
+summary counted worktree *rows* rather than distinct sessions, so it reported 9 holders where the
+truth was 8 — one session (pid 19376) held two worktrees while this was being written. I read my
+own output, walked the subtraction, and got a wrong bound out of it one paragraph after shipping
+the line. Now deduplicated, with `claim selftest` asserting the **delta** (two worktrees taken by
+one new session raise the count by exactly one) because the repository this runs in has real
+claims of its own and an absolute assertion is not testable there. Mutation-tested: removing the
+dedupe makes it read `9 -> 11`.
+
+**Third instrument in this session whose first version was wrong in a way only use exposed** —
+`0069`'s worktree evidence, `0071`'s walk diagnostic that set a global inside a command
+substitution, and this one's row-vs-session count. All three read correctly and all three were
+wrong. **In a shell script with no test framework, the assertion is not the check — breaking the
+feature and watching it fail is.**
+
+**What was not chosen.** Reading the harness's socket registry from `scripts/claim`: it works, and
+it is rejected because **it is not the repository's business how its sessions are supervised** — a
+lock that hardcodes one supervisor's private layout fails silently the day that layout changes,
+and silently in the direction of calling live sessions dead. Failing closed on an untestable
+identity, again. And stealing the orphans, which is a decision about someone's work rather than
+about a diagnostic.
+
+**Left open, and it is the substantive half: 16 uncommitted files sit in six orphaned worktrees**
+— `next2` 8, `g41232` 7, `bug35rans` 1, plus `bug32`, `coord2`, `rebaseline`. Read from their
+diffs, the work is coherent and not scratch: `next2` carries PERF-2's dynamic-offset UBO slots
+with a `[perf2] uniform_buffers=` canary, `g41232` an env-gated `GNC_MC_CLAMP_VISIBLE` motion-comp
+clamp, `bug35rans` a packed histogram in `quantize_histogram_fused.wgsl` that is net −46 lines,
+`tile1` (since inherited by a peer) a `PLANE_PAD_ALIGN` / `tile_extent` padding rework across
+three shaders. **Preserving it behind a ref via `git stash create` — which touches no worktree,
+index or branch — was attempted and refused by the permission layer**, so it is not done and was
+not smuggled in another way. It is the cheapest known way to make that work survive and it needs
+the project owner's decision.
+
+**Gates.** Shell only: no Rust, no WGSL, no bitstream, so the cargo gates cannot be affected and
+were not re-run (DOC-1 / ENT-7 precedent). `scripts/claim selftest` passes all ten cases.
+Decision `0076`.
+
+---
+
+## BUG-48 — the padding fill is a wavelet lever, and keying the fix on quality would have cost 4.6% (2026-09-08)
+
+**Hypothesis, from the filing.** `quality_preset(100)` keeps PAD-1's decay padding fill, which
+LOSSLESS-3 measured as a **loss** at q=100 on two stills (crowd_run frame 0 +0.78%, bbb frame 0
++0.66%). The filing proposed one line in `quality_preset` — `pad_fill_decay: q != 100` — and asked
+for a four-image sweep to justify it.
+
+**The premise reproduces on all four of PAD-1's stills, and the proposed fix is wrong.**
+
+### Step 1 — reproduce, on the images the original lever was measured on
+
+One binary, both arms via `GNC_PAD_FILL`, `q=100` (there is no RATE-2 sibling at q=100, so the env
+var isolates the lever exactly):
+
+| still | decay (shipped) | replicate | |
+|---|---|---|---|
+| bbb_1080p | 3 257 157 | 3 235 737 | **−0.658%** |
+| blue_sky_1080p | 2 166 911 | 2 153 118 | **−0.637%** |
+| kristensara_720p | 931 263 | 927 600 | **−0.393%** |
+| touchdown_1080p | 2 627 186 | 2 610 478 | **−0.636%** |
+
+### Step 2 — the measurement the filing did not ask for, and it changes the fix
+
+**q=100 is not always MED.** `GNC_MED=0` makes the same preset a lossless *wavelet* encode. Same
+four stills, same binary:
+
+| still | decay | replicate | |
+|---|---|---|---|
+| bbb_1080p | 3 260 563 | 3 436 337 | +5.391% |
+| blue_sky_1080p | 2 744 873 | 2 866 708 | +4.439% |
+| kristensara_720p | 1 169 457 | 1 178 520 | +0.775% |
+| touchdown_1080p | 2 967 518 | 3 131 749 | +5.534% |
+| **total** | | | **+4.643%** |
+
+**−4.64% against `0039`'s −4.63%**, same four images, and `0039` took its figure over q=80..94
+with `--abac`. So the fill is worth exactly what PAD-1 said at the very top of the ladder *when a
+wavelet is what codes the padding* — and the reversal belongs to **MED**, which has no subbands to
+zero and has to code a gradient the fade puts in front of its spatial predictor.
+
+`pad_fill_decay: q != 100` would therefore have bought 0.6% on one arm by giving up 4.6% on the
+other. The gate went inside `quality_preset`'s MED branch instead.
+
+**Why this was cheap to catch and worth writing down:** the filing's mechanism paragraph already
+said "at q=100 the transform is MED, not the wavelet". The mechanism named the right variable and
+the proposed fix keyed on a different one. Reading a filing's *reason* against its *patch* is a
+ten-minute check that does not need a hypothesis of its own.
+
+### Gate
+
+`scripts/gate_bug48.py`, 40 encodes across a before and an after binary. **Only the four q=100 MED
+cells move.** Byte-identical: all four stills at q=85, 90, 95, 97 and 99; all four at q=100 under
+`GNC_MED=0`; and 8 sequence points (crowd_run and bbb, q=99 and 100, ki=2 and 9). The sequences
+were never at risk — `0039` clears the flag for referenced I-frames and LOSSLESS-3's all-intra arm
+clears it explicitly, citing BUG-48 before it existed as a fix.
+
+**Canary:** `pad_fill_mode` under `GNC_DIAGNOSTICS` names the mode and the path default. q=100 →
+`replicate`, q=100 `GNC_MED=0` → `decay`, q=90 → `decay`.
+
+### Left on the table, filed as BUG-50
+
+The gate table shows q=97 and q=99 emitting **byte-identical files** on three of four stills
+(blue_sky 2 166 911, kristensara 931 263, touchdown 2 627 186). That is RATE-2's bit-exact sibling
+winning and being kept — and the sibling is a MED encode that inherits the *caller's*
+`pad_fill_decay`, which the q=95..99 presets set to `true`. So the same 0.4–0.7% is sitting in
+shipped output on the rungs where the sibling is what ships.
+
+Not taken here, for a reason with a measurement behind it rather than caution: `0072` made that
+inheritance deliberate, so both candidates leave the same padded source in `input_buf`, and its
+own figure is that forcing the fills to agree makes 24 of 24 sequence points byte-identical where
+10 moved otherwise. `encode()` is shared between the still and sequence paths, so the still path
+is not obviously independent — re-measuring `0072`'s 24 points is the whole of BUG-50.
+
+**Gates:** `cargo test --release -- --test-threads=1`, `cargo clippy --release`, wasm `--lib` — see
+the commit. Decision record: `docs/decisions/0077`.
+
+---
+---
+---
+
+## COORD-6 — a cheap mechanism does exist, and it is what the encoder produces rather than what it is (2026-09-08)
+
+**What was open.** COORD-4 priced the two obvious mechanisms against six instances of a number read
+against the wrong tree and **refused both** — a claim-time `HEAD` stamp catches 1, printing each
+claim's commit catches 0 — then shipped consolidated prose. COORD-6 asked one question: **is there a
+cheap mechanism, or is this an accepted cost of eight-session concurrency?** Both answers close it;
+a third round of prose does not.
+
+**Domain declaration.** A CLI subcommand and two lines in a harness. No encoder path is touched and
+the fingerprint of the shipped encoder is unchanged by this work — which the tool itself asserts,
+and is the neatest available demonstration of what it is for.
+
+### Instance 7 arrived while the item sat in the queue, after the prose was consolidated
+
+LOSSLESS-3 (`0070`) published a q=95/97/99 sequence table against a bit-exact q=100 column and
+concluded camera content is dominated from q=95 up. **Those lossy columns contain bit-exact
+I-frames** — RATE-3 put them there — so BUG-47 (`0072`) moved every one of them by roughly 1.8
+points hours later, while q=100 stayed put because there is no sibling at q=100. Its P1 conclusion
+survives; every margin is overstated. Found and reported by the RATE-3 session, flagged to
+LOSSLESS-3's owner rather than edited.
+
+Tally: **5 of 7 for the `main`-moved-under-a-table shape**, against 1 of 7 for the cross-session
+shape COORD-4 refused a tool for.
+
+**And it was caught before publication — by people, not by a mechanism**, which is the less
+convenient half and the one that shapes the decision. This session noticed BUG-47 moved the
+sibling's bytes and said so, the RATE-3 session relayed it, and LOSSLESS-3's owner re-took the
+sweep on `d10e414`. Nothing was published wrong. The re-take showed the stakes were not a stale
+margin either: bbb was the cell predicted to flip *toward* domination and moved the other way, from
+−1.9% as filed to ±0.00% at all six points with the trigger not firing at all.
+
+So the honest statement is **the class recurred after the prose was consolidated, and the prose plus
+one attentive peer was sufficient that once.** The mechanism below is justified on price — half a
+second — as a **backstop**, not because the peer chain failed.
+
+### The mechanism, and the measurement that says it is the right one
+
+```
+$ gnc fingerprint
+codec-fingerprint v1 700d5f8a  (10 configurations)
+```
+
+(`abf86a50` while this was written, `700d5f8a` one merge later — ENT-9 step 2 moved abac's output.
+Quoting a digest dates the quote, which is the point.)
+
+A pinned, versioned matrix of ten configurations — Rice/rANS/abac, 4:4:4 and 4:2:0, q=10/50/90/99/100,
+stills and 3-frame sequences at ki=2 — encoded and digested. **0.52 s**, against the minutes a real
+sweep costs. It runs the only honest test of "did the output move", which the item had assumed was
+too expensive to be the answer; it is not, at 384×384.
+
+**The proxy to beat is `shasum target/release/gnc`, which several harnesses already print — and the
+pair that beats it was produced while building this.** Adding an entire module and editing
+`main.rs` moved the binary hash from `94f25712…` to `333e2c62…` and left the fingerprint at
+`abf86a50`, because the encoder's output had not moved. A check that fires on every rebuild trains
+its reader to skip it.
+
+Sensitivity, against knobs whose effect was already measured elsewhere:
+
+| knob | does output move? | fingerprint |
+|---|---|---|
+| `GNC_REF_FROM_SOURCE=0` | **no** — 24 of 24 points byte-identical (`0072`) | **unchanged** |
+| `GNC_PAD_FILL=decay` | yes (`0039`) | changed |
+| `GNC_DEAD_ZONE=0.3` | yes (`0028`) | changed |
+| `GNC_REF_DEBLOCK=1` | yes | changed |
+
+Silent on the one knob known to be output-neutral, firing on all three known to move output. That
+is what the item's own suggested proxy — "did the merge touch `src/`?" — cannot be: `0045`'s
+diagnostic-only change is byte-identical with its env var unset, and a `src/` proxy warns on it.
+
+**Against the seven instances:** 2, 3, 5, 6 and 7 are published tables whose rows came from
+different encoders — caught, *if the rows carry the fingerprint*, which is why two harnesses were
+changed and not only the docs. 4 is a mid-sweep rebuild — caught mechanically by the before/after
+check, with no reader involved. 1 is the cross-session patched tree — caught, a patched encoder
+digests differently. Better than either refused tool on the same list, and that is the optimistic
+reading; the pessimistic one is that none of it fires unless a number carries the token.
+
+### Two things the implementation had to get right, and both were wrong first
+
+- **Determinism is the whole product**, so it is asserted rather than assumed:
+  `fingerprint_is_deterministic_and_every_row_is_a_distinct_sample` runs the matrix twice in one
+  process and compares every row.
+- **Every row must be a distinct sample.** The first input generator was hash noise, on which the
+  bit-exact candidate wins every frame — so the **q=99 and q=100 sequence rows coded to identical
+  bytes** and one of the ten configurations was measuring what another already had. The test fails
+  on a row collision, and **it fired again on the very next merge**: those two rows had differed on
+  the tree the matrix was written on and were identical one merge later. That is the assertion
+  earning its keep before the tool shipped.
+- **A "sequence" row must contain a P-frame, and a byte count cannot show that it does.** The input
+  frames were three different pictures, which fired the scene-cut detector every frame: both
+  sequence rows were **all-intra**, testing no inter path — and at q=99 every I-frame then keeps
+  the bit-exact sibling, which *is* `quality_preset(100)`, so those two rows were byte-identical for
+  a reason unrelated to either configuration. The input is now **one scene panned 3 px per frame**,
+  every row prints its composition (`2I+1P+0B`), and the test asserts at least three sequence rows
+  contain a P. `seq q100 ki9` reports `3I+0P` **on purpose** — LOSSLESS-2 re-codes a lossless
+  P-frame costing more than the previous I — and that is asserted separately, so the row is
+  coverage rather than an accident.
+
+  The content is integer-valued because BUG-45: a fractional source makes a lossless configuration
+  quietly lossy, and a fingerprint whose lossless rows were secretly lossy would measure that
+  instead.
+
+**Not made mandatory**, and deliberately: nothing enforces it and nothing should yet. The matrix's
+coverage is unproven outside the four knobs above, and a mandatory check believed past its range is
+worse than an optional one read with judgement.
+
+**Gates:** `cargo test --release` and both clippy targets. Decision `docs/decisions/0075`.
+
+---
+
 ## MEAS-11 — the abac ladder re-taken: +66.0% -> +61.0%, and ENT-9 flattened the decay (2026-09-08)
 
 **Pinned to `a0880c7`.** `scripts/meas1_vs_h264.py`, 1920x1080, 17 frames, ki=9, 4:2:0, 8-bit,
@@ -917,6 +2230,80 @@ theatre.
 **BUG-38 (P4)** with the heading committed alongside the reserved id, not fixed here:
 reformatting 44 modules that eight live sessions are editing conflicts with all of them and
 carries no behaviour. It wants a quiet tree and one commit that changes nothing else.
+
+## BUG-46 — the bit-exact candidate was always 4:4:4, and fixing that exposed a lossless path that is not lossless (2026-09-08)
+
+**What was filed.** `lossless_sibling` builds RATE-2's bit-exact candidate from
+`quality_preset(100)` and copies the choices that say *how* to code — coder, GPU/CPU, abac knobs,
+tile size, and since BUG-47 the padding fill — but not `chroma_format`. The canary showed it
+plainly, bbb at q=97:
+
+```
+--chroma-format 444:  lossy 2 843 371 B vs bit-exact 3 257 157 B (+14.55%), keeping the lossy one
+--chroma-format 420:  lossy 1 660 019 B vs bit-exact 3 257 157 B (+96.21%), keeping the lossy one
+```
+
+**The same 3 257 157 B for both requests.** So on subsampled input RATE-2 compared a 4:2:0 wavelet
+encode against a 4:4:4 lossless one — three times the chroma samples — and could essentially never
+fire. Every RATE-2 / RATE-3 / LOSSLESS-3 figure is a 4:4:4 figure as a result: not "unmeasured
+elsewhere", *unreachable* elsewhere. That scope was not previously written down anywhere.
+
+**Domain declaration.** Whole coded stills, bytes from the encoder and per-plane PSNR from the
+decoded PNG against the source. The question is not "is the fix smaller" but "are the two
+candidates the same picture", which is what makes RATE-2 metric-free — so quality is the measured
+quantity here, not a control.
+
+### The one-line fix works, and it must not ship
+
+`out.chroma_format = cfg.chroma_format` makes the candidate honest, and the fallback then fires:
+bbb 4:2:0 q=99 takes the bit-exact file at 1 847 304 B against 1 898 635 B, **−2.70%**.
+
+**And a large colour regression.** The reason is not the fix: `q=100` on subsampled chroma is much
+worse in *colour* than `q=99`. dE00 against the source, each arm forced with
+`GNC_LOSSLESS_FALLBACK=0`:
+
+| still | format | dE00 mean q=95 | q=99 | **q=100** | p95 q=99 | **p95 q=100** |
+|---|---|---|---|---|---|---|
+| blue_sky | 4:2:2 | 0.333 | 0.115 | **2.307** | 0.664 | **7.358** |
+| blue_sky | 4:2:0 | 0.354 | 0.139 | **1.949** | 0.727 | **5.742** |
+| bbb | 4:2:2 | 0.801 | 0.735 | **2.723** | 2.348 | **6.575** |
+| bbb | 4:2:0 | 1.017 | 0.960 | **2.557** | 3.210 | **6.146** |
+| kristensara | 4:2:2 | 0.408 | 0.140 | **2.142** | 0.716 | **5.649** |
+| kristensara | 4:2:0 | 0.423 | 0.160 | **1.888** | 0.746 | **4.850** |
+
+**2.7x to 20x worse, 6 of 6 points**, p95 above 4.8 everywhere, and 4:4:4 at q=100 is exact (dE00
+0.0000). The inversion survives in this metric and is *specific to q=100*: 4:2:2 beats 4:2:0 at
+q=95 and q=99 as it must (0.333 vs 0.354, 0.115 vs 0.139 on blue_sky) and loses to it at q=100 on
+all three images. Filed as **BUG-49 (P1)**.
+
+**Retracted on the way, and it is CLAUDE.md's own example.** The first version of this entry and of
+BUG-49 said "`q=100` is not lossless *even in luma*", from per-plane PSNR on the decoded RGB
+converted to `yuv444p` — 47-52 dB. That is the contaminated measurement CLAUDE.md warns about
+("a luma computed from decoded RGB is contaminated by chroma error", recorded there at 3.7x
+overstatement). In **YCoCg-R**, the plane GNC actually codes, luma at q=100 is **the best of the
+three rungs**: 57.4-66.9 dB against 52.3-52.7 at q=95. The luma claim is withdrawn; the colour
+defect above is what is real, and it is larger than the thing that was retracted. Cost of the
+error: one wrong filing, live on `main` for about an hour, corrected in the same session by running
+`scripts/ypsnr_de00.py` — which the rule says to use first for anything touching chroma.
+
+### What shipped: an honest candidate and an explicit refusal
+
+The sibling carries the format, and `encode` refuses the comparison on subsampled chroma with a
+canary naming the format and BUG-49. **Byte-identical to `main`** on bbb at 4:4:4 / 4:2:2 / 4:2:0,
+q=97 and q=99 — the refusal restores exactly what the missing field was producing by accident,
+which is the point: the accident and the intention agree today and stop agreeing the moment BUG-49
+is fixed.
+
+Refusing rather than taking the −2.70% is not conservatism for its own sake. `0036`'s licence to
+act without a metric is that its candidate wins on both axes at once; a trade of −3.9 dB for 2.7%
+of rate is 13x CLAUDE.md's 0.3 dB "flag and investigate" threshold, and smuggling it in under that
+licence would make "q=99" mean something different at 4:2:0 without saying so.
+
+Decision `docs/decisions/0078`. Harness `scripts/meas_bug46_chroma_sibling.py` — it reports both
+arms' bytes *and* PSNR and flags any point that is not better on both axes, which is what caught
+this on the first run.
+
+---
 
 ## LOSSLESS-3 — above q=95 a camera sequence is dominated by its own lossless encode, and the swap is a sequence choice, not a frame choice (2026-09-08)
 
@@ -2141,6 +3528,113 @@ not an argument for a 1.69× frame decode. Decision record `0045`.
 
 ---
 
+## MEAS-2, the last two toggles: the pyramid's leaf scale is right below q≈80 and wrong above it (2026-09-08)
+
+**Hypothesis.** MEAS-2 left two of its five toggles unmeasured, both behind BUG-5's pyramid-off
+default: `GNC_PYRAMID_L3_QP_SCALE` (1.5, justified in a comment as "matches H.264 QP+4 practice
+for inner B-frames" — true, and not a measurement) and `GNC_PYRAMID_L2_QP_SCALE` (1.0, commented
+"off until validated"). Expected the leaf scale to earn its keep, because nothing references a
+leaf B-frame, and the layer-2 scale to be roughly neutral, following TUNE-5's shape for P-frames.
+
+**Domain.** Quantiser step per frame, applied to the wavelet coefficients of one B-frame before
+entropy coding. The decoder reads the step from the frame header, so no decoder change is
+possible or needed.
+
+**Why the knob could not be validated before.** `[pyramid_b] … layer=2` printed the reference
+indices and *not* the quantiser, while the layer-3 line printed both. There was no way to observe
+whether the encoder had read `GNC_PYRAMID_L2_QP_SCALE` at all — which is how "off until validated"
+survives a week. Both layer-2 sites now print `qstep=… (l2_scale=…x)`, and layer 3 additionally
+reports whether the value came from the env var or the taper.
+
+**Shape of the run** (`scripts/meas2_pyramid_qp.py`): six arms — the pyramid suppressed, plus five
+l2:l3 pairs — on crowd_run, old_town_cross and bbb_extended, 24 frames, 4:4:4, **ki=17 in every
+arm**. The reference is the pyramid *off at the same keyframe interval*: BUG-5 compared
+ki=17-with-B against ki=8-P-only, which moves GOP length and the pyramid together, so nothing here
+is comparable with BUG-5's figures. Every arm is integrated over one common quality interval per
+sequence and metric (QUAL-1), since a coarser leaf lowers the top of its own ladder.
+
+### The two halves disagree, and both are right
+
+q=30/50/65/75 — VMAF leads (CLAUDE.md's table). BD-rate against the pyramid off, negative = fewer
+bits:
+
+| | l3=1.0 | **l3=1.5** | l3=2.0 |
+|---|---|---|---|
+| VMAF | −3.9% | **−12.1%** | −11.5% |
+| worst-frame PSNR | +10.0% | **+1.8%** | +13.4% |
+| mean PSNR | −7.9% | −10.3% | −11.1% |
+
+The convincing part is that VMAF and the worst frame *agree* down here: 1.5× is not buying the
+mean at the tail's expense, it is better on the tail than either neighbour. crowd_run's VMAF was
+discarded by the saturation guard (overlap 99.53–99.87); old_town_cross reads −5.1% and
+bbb_extended −19.0%.
+
+q=85/88/90/92/94 — PSNR leads, VMAF discarded on all three sequences (overlaps 99.21–99.89):
+
+| | l3=1.0 | l3=1.5 | l3=2.0 | l2=1.25 l3=1.5 | l2=1.5 l3=1.5 |
+|---|---|---|---|---|---|
+| mean PSNR | −4.6% | −5.0% | −4.9% | −4.9% | −4.8% |
+| worst-frame, bbb_extended | **−14.4%** | −5.6% | +7.3% | −7.4% | −5.7% |
+| worst-frame, camera clips | — | — | — | — | — |
+
+**Mean PSNR cannot referee this knob**: 0.4 points of spread across five arms. The worst frame
+spreads them by 22 points — and on the two camera clips there is *no overlap to integrate*, which
+says more than a BD-rate would. On crowd_run the pyramid-off arm's worst rung still reaches 47.48
+dB on its worst frame, while the l3=1.5 arm's *best* rung over the whole q=85–94 ladder reaches
+46.71. The tail penalty is larger than the ladder's entire quality span.
+
+Matched q, crowd_run q=85, no fitting involved:
+
+| arm | bytes | mean PSNR | worst frame |
+|---|---|---|---|
+| pyramid off | 74 997 760 | 47.91 | **47.48** |
+| l3=1.0 | 74 809 828 | 47.91 | **47.48** |
+| l3=1.5 (was the default) | 70 692 750 | 46.82 | 44.65 |
+| l3=2.0 | 67 875 419 | 46.03 | 42.29 |
+
+−5.7% of the bytes for −2.83 dB on the worst frame.
+
+**Mechanism for the flip.** At q=30 the leaf's step is 13.9 and its error is dominated by what
+bi-prediction failed to predict, so coarsening adds little to an error that large and the rate
+saving is nearly free. At q=90 the step is 2.24 and the leaf's error *is* its own quantiser, so
+1.5× converts directly into 2.8 dB on that frame. Same knob, opposite regimes — the same shape as
+AQ (off below q=30) and Rice-vs-rANS (boundary at q=20).
+
+**Shipped:** `GNC_PYRAMID_L3_QP_SCALE` becomes a taper on the quantiser step — 1.5 at step ≥ 4.0
+(q=75), 1.0 at step ≤ 2.8 (q=85), linear between, keyed on the step for `p_qp_scale`'s two reasons
+(the step is the physical quantity; `q` does not exist at that site under `--qstep` or rate
+control). The breakpoints are the measured ones and the ramp is interpolation. `GNC_PYRAMID_L2_QP_SCALE`
+stays 1.0 — validated, and off is right at contribution quality. Decision `0061`.
+
+**Nothing ships differently by default**, because the pyramid is off by default. Verified byte-exact
+against the measured arms: default pyramid-off q=90 = 82 057 506 (unchanged), taper at q=50 =
+26 688 057 (= the l3=1.5 arm), taper at q=90 = 81 869 091 (= the l3=1.0 arm), env override 1.5 at
+q=90 = 77 632 449 (= the old default).
+
+### Two things found on the way, both worth more than the toggle
+
+**A measurement was superseded mid-flight, and the guard for it did not exist.** The first q ≥ 85
+table was taken at q=85/90/92/95/99 on `a73e0a2`. LOSSLESS-3 (`0073`) then landed and emits a
+q=95..99 4:4:4 camera sequence bit-exact when the lossy encode is larger, so on the current tree
+those two rungs return `psnr = inf` — and a Bjontegaard fit over an infinity is a silent
+non-number, INTRA-1's trap. It is worse here than there: a bit-exact encode is all-intra, so every
+arm's rung is *the same bytes* and the toggle under test is not in the output being compared.
+`finite_or_die` now drops and reports a non-finite rung, and the re-taken ladder stops at q=94.
+The re-take also proves the merge changed nothing in range — all 30 q ≤ 94 rungs are byte-identical
+across it, and so are four q ≤ 75 points from the lossy half, which is why that half was not re-run.
+
+**At matched ki, part of what BUG-5 measured was GOP length.** With the leaf scale off the pyramid
+is cheaper than P-only on all three clips on both metrics (bbb_extended −12.2% mean, −14.4%
+worst-frame). This changes no default: the pyramid still costs 8 frames of reordering latency
+(`0033`), BUG-5's own figures were taken lower down the ladder, and on this content inter is itself
+losing — crowd_run at q=85 costs 69 919 536 bytes all-intra against 74 997 760 for I+P, so every
+arm above sits inside a configuration 7.3% behind not coding inter at all.
+
+**Left open:** the lossy half of the l2 scale (the q=30–75 grid was l3-only), which is what remains
+of MEAS-2.
+
+---
+
 ## BUG-35 — the histogram arena is guarded; shrinking it is refused (2026-09-08)
 
 **Hypothesis.** `shared_hist` is 5120 bins. `total_hist_entries` can reach 49152. naga clamps
@@ -2230,6 +3724,52 @@ file.
 8 distinct. Combined with the existing 16-racer / 6-picker tests: PASS.
 
 No codec change. No measurement moved.
+## PAD-2 — Dirac zero-extend on inter is worse than the fill PAD-1 already refused (2026-09-08)
+
+**Hypothesis.** PAD-2's cheaper-first candidate: zero-extend the tile padding on inter, as
+Dirac §13.1.2 Note / Schroedinger `schro_frame_zero_extend`. A zero-padded current against a
+zero-padded reference differences to nothing *in the padding*, so the padding's own residual
+vanishes. That is a different mechanism from PAD-1, which asked which fill predicts best.
+
+**Domain.** Encoder pad fill (`pad.wgsl` `fill_mode=2`, `GNC_PAD_FILL=zero`). Not the
+decoder, not MC, not a bitstream version. Default is unchanged.
+
+**Canary.** `GNC_DIAGNOSTICS=1 GNC_PAD_FILL=zero` prints `pad fill = zero` on both the
+sequence-buffer write and the still path. Default still prints `decay` / sequence `replicate`.
+
+**Measured**, `scripts/meas_pad1_inter.py`, ki=9, 17 frames, three sequences, q=85/92, 4:4:4 and
+4:2:0, against `GNC_PAD_FILL=replicate`. Not idle; bpp/PSNR are deterministic.
+
+| sequence | chroma | q | decay rate / dWORST | **zero rate / dWORST** |
+|---|---|---|---|---|
+| crowd_run | 444 | 85 | −6.92% / +0.000 | −8.66% / +0.000 |
+| crowd_run | 444 | 92 | −6.92% / +0.000 | −8.72% / +0.000 |
+| crowd_run | 420 | 85 | −9.02% / +0.000 | −11.09% / +0.000 |
+| crowd_run | 420 | 92 | −9.04% / +0.000 | −11.15% / +0.000 |
+| old_town_cross | 444 | 85 | −7.81% / −0.900 | −9.10% / **−2.110** |
+| old_town_cross | 444 | 92 | −7.75% / +0.000 | −8.65% / **−1.610** |
+| old_town_cross | 420 | 85 | −10.20% / −0.490 | −11.49% / **−1.360** |
+| old_town_cross | 420 | 92 | −10.09% / +0.000 | −11.13% / **−0.980** |
+| bbb_extended | 444 | 85 | −8.70% / −2.470 | −9.68% / −2.470 |
+| bbb_extended | 444 | 92 | −9.14% / −4.030 | −10.75% / **−4.960** |
+| bbb_extended | 420 | 85 | −9.80% / −0.360 | −10.64% / −0.380 |
+| bbb_extended | 420 | 92 | −10.24% / −0.350 | −11.49% / −0.470 |
+
+Default vs replicate: **+0.00% rate, +0.000 dB on all 12** — the shipped inter path did not move.
+
+**Verdict: FAIL.** Zero-extend regresses **8 of 12** points > 0.3 dB (decay: 6 of 12). Worst is
+bbb_extended 4:4:4 q=92 at **−4.960 dB**, worse than decay's −4.030 dB. Mean rate −10.21% vs
+decay's −8.80%: the extra saving *is* the worse prediction. old_town at q=92, which decay left
+at 0.000 dB, goes to −1.61 / −0.98 dB.
+
+The filing's caveat holds: vanishing padding residual says nothing about visible edge blocks
+whose MVs point outward, and that is where the 4 dB went. **Do not ship zero as an inter
+default.** `GNC_PAD_FILL=zero` stays as a harness arm.
+
+**Next on this item**, the other cheap check: clamp MC's reference reads to the *visible* bounds
+instead of the padded ones (`motion_compensate.wgsl` currently clamps to `params.width/height`,
+which are the padded dimensions). That is a decode-process change if it ships; measuring it
+does not require a bitstream bump.
 
 ---
 
@@ -14003,8 +15543,6 @@ five-byte flush are the next two steps, in that order.
 
 ---
 
----
-
 ## 2026-09-06 — Web demo repaired, and the temporal wavelet is not what we assumed
 
 ### BUG-15: the GNV2 decode path ignored the output pattern
@@ -14233,8 +15771,6 @@ halves now exist in this repo.
 Decode throughput on the real path. Four sessions were building on this machine and COORDINATION
 rule 1 forbids timing under load; the 201 fps figure is the isolated gate, not the shipped
 decoder. Measure on an idle machine before quoting any lossless fps.
-
----
 
 ---
 
@@ -17416,3 +18952,910 @@ two quantisers, these three). It is worth treating as a pattern rather than thre
 q=100 sequences decode to a worst-frame **7.91 dB** on crowd_run. That is **BUG-39**, already
 reserved by the RATE-3 session; byte-identical under both multipliers here, so this change neither
 causes nor fixes it. Mentioned because it is a lossless mode reading 7.91 dB.
+
+---
+## 2026-09-08 (round 3) -- inter now runs on the Windows laptop, and the first clean inter density number
+
+Same machine as round 2: Windows 11 Pro laptop, **Intel Arc Pro Graphics** + **NVIDIA RTX 2000 Ada
+Laptop GPU**, 31.5 GB RAM. Built and run from **f90f94d**, which **has the BUG-25 fix** (`51a9ac6`;
+`git merge-base --is-ancestor 51a9ac6 HEAD` = yes). Round 2 was `f17bf1b`, which predated it. Python
+and ffmpeg run from a policy-allowed path (AppLocker), gnc from the redirected `CARGO_TARGET_DIR`.
+
+The point of the round was the two items `docs/decisions/0029` and the updated `GPU_TIER_TEST.md`
+left owed: re-run the inter path on this hardware now that BUG-25 is fixed, and measure density with
+the modes that time the GPU rather than the CPU (BUG-32).
+
+### Inter (P-frames) now works on both GPUs -- 0029's expectation is now a measurement
+
+`benchmark-sequence -k 9` (I+P), the exact path that crashed in round 2 with `0xC0000005` (NVIDIA)
+and `0xC0000409` (Intel) on the pre-fix module:
+
+| GPU | backend | exit | frames | total bytes | encode time |
+|---|---|---|---|---|---|
+| NVIDIA RTX 2000 Ada | Vulkan | **0** | 1I+4P | 1972436 | 411.9 ms (12.1 fps) |
+| Intel Arc Pro | Vulkan | **0** | 1I+4P | 1972436 | 798.3 ms (6.3 fps) |
+
+Both encode inter cleanly. **Output is byte-identical across the two different-vendor GPUs**
+(1972436 bytes), so the cross-backend determinism that round 2 showed for intra holds for inter too.
+Encode time ratio 1.94x (NVIDIA faster), consistent with CANARY-1's 2.01x. This is exactly what 0029
+predicted and declined to claim as measured ("an expectation, not a measurement"); it is measured
+now. Round 2's two Windows crashes are confirmed as the one invalid-SPIR-V module, not driver bugs.
+
+### CANARY-1 -- regression check, reproduces at 2.01x
+
+`--tier`, bbb q=90, best-of-5, Vulkan:
+
+| device | encode | decode | settle |
+|---|---|---|---|
+| Intel Arc Pro | 34.59 ms (28.9 fps) | 25.42 ms | 1.01 / 1.01 |
+| NVIDIA RTX 2000 Ada | 17.24 ms (58.0 fps) | 10.92 ms | 1.01 / 1.02 |
+
+**Spread 2.01x** (round 2: 2.05x). A 2% move at settle 1.01 is noise: +26k lines of merged work
+across the codebase did not move CANARY-1. Encode times are a hair faster (34.59 vs 36.45, 17.24 vs
+17.75) but within the same noise. Microsoft Basic Render Driver (WARP) still panics.
+
+### MEAS-5 density -- two modes now measure the GPU, and they tell a two-part story
+
+Round 2's density used `benchmark-sequence` without knowing it spends 86% of wall on CPU PSNR/SSIM
+(BUG-32) and retains the whole decoded sequence. Both are now avoidable.
+
+**Inter, shipped config (`--density`, i.e. `benchmark-sequence --throughput`, decision 0046),
+NVIDIA, levels 1,2,4:**
+
+| N | completed | wall s | aggregate fps | scaling |
+|---|---|---|---|---|
+| 1 | 1/1 | 5.0 | 24.10 | 1.00x |
+| 2 | 2/2 | 6.4 | 37.27 | 1.55x |
+| 4 | 4/4 | 10.8 | 44.49 | **1.85x** |
+
+**Monotonic, no collapse.** This is the first clean *inter* density number on any hardware -- the
+doc said none was available until the `--throughput` flag existed, and it now does. Removing the
+metrics and the sequence retention is what lets it scale where round 2's number collapsed.
+
+**Intra (`--density-still`, `benchmark` one frame + GPU-power sampling), NVIDIA:**
+
+| N | completed | wall s | aggregate fps | scaling | GPU power mean/max W |
+|---|---|---|---|---|---|
+| 1 | 1/1 | 2.2 | 11.03 | 1.00x | 19.1 / 38.3 |
+| 2 | 2/2 | 3.3 | 14.51 | 1.32x | 29.3 / 35.0 |
+| 4 | 4/4 | 15.2 | 6.30 | 0.57x | 30.6 / 48.7 |
+| 8 | 0/8 | ~727 (aborted) | -- | OOM | 2.0 / 32.8 |
+
+**The common ceiling is per-process memory, not GPU compute.** A single `--throughput` process peaks
+at **1847 MB** (measured), so N=8 is ~15 GB and thrashes to a stop (GPU power falls to 2.0 W mean --
+the card is idle, waiting on RAM). GPU power never exceeds ~49 W and plateaus near 30 W, so the card
+is not the bottleneck at any N that completes. On this 32 GB laptop that memory footprint caps useful
+concurrency around N=4.
+
+One honest inconsistency: the inter sweep scales to 1.85x at N=4 while the intra-still sweep
+*collapses* to 0.57x at the same N, on the same GPU. Both hold ~1.8 GB, so 4 instances (7.2 GB) fit
+either way -- the difference is not memory. The likely cause is that intra-still's per-process work is
+tiny (one frame x 24 iters = 2.2 s at N=1), so concurrent GPU/driver init dominates its wall, while
+the inter sweep's 120-frame work amortises that. The robust, mode-independent finding is the N=8 RAM
+ceiling; the N=4 intra collapse is a measurement of startup contention, not of GPU scaling.
+
+### DX12 -- the fast crash is gone, replaced by a compile that does not finish
+
+Round 2: DX12 encode died in seconds with FXC `X3695: race condition writing to shared` in
+`block_match_bidir.wgsl`. On f90f94d's shaders that error is gone -- but the DX12 encode now sits in
+FXC shader compilation for **>4.5 minutes at 95% CPU** (261 CPU-seconds, 469 MB, no output) before it
+was killed. Whether it would ever complete is unknown; a multi-minute single-threaded compile per
+process is not usable regardless. **DX12 remains non-functional for GNC in practice**, now for a
+compile-time reason rather than a compile-error one. Not investigated further this round.
+
+### hwenc -- unchanged
+
+NVENC is still refused (ffmpeg 9.0.1 wants NVIDIA driver 610+/nvenc 13.1; machine has 13.0). Intel
+QSV was measured in round 2 (4.54x at N=8) and not re-run.
+
+### State
+
+- **Inter on Windows: WORKS**, on both GPUs, byte-identical output. 0029's owed measurement is done.
+- **CANARY-1: PASS, 2.01x** -- reproduces round 2's 2.05x within noise; a regression check now.
+- **MEAS-5 inter density: 1.85x at N=4, monotonic** (first clean inter number, via `--throughput`).
+- **MEAS-5 intra density-still: memory-bound** -- ~1.8 GB/process caps concurrency ~N=4, N=8 OOMs;
+  GPU power shows the card idle-waiting, not compute-bound.
+- **DX12: still unusable** -- X3695 gone, replaced by a >4.5-min FXC compile. Needs its own item.
+- **Still owed:** N=8+ inter density on a machine with more RAM (or a lower-footprint encode path);
+  NVENC (driver); large-GPU MEAS-5; whether DX12 ever finishes compiling; 4:2:2 and 10-bit on Vulkan.
+
+---
+
+## 2026-09-10 — BUG-49: the box filter makes fractions, and MED turns a half-LSB into drift
+
+**Hypothesis on entry (the item's own):** a `MedPredict` branch in `chroma_resample.rs` changes
+the filter or skips a pass, or a plane extent is derived two ways (`entropy_helpers.rs:110`
+computes `padded_w * (tiles_y * tile_size)` where the buffer is `padded_w * padded_h`).
+**Both refuted.** The resampler has one code path for every quality and never sees the transform
+type, and `chroma_padded_height()` *is* `chroma_tiles_y() * tile_size` by construction, so the two
+derivations cannot disagree.
+
+**Reproduced first**, on the pinned entry commit `e6d3794`, three stills x three formats x
+q ∈ {95, 99, 100}, `GNC_LOSSLESS_FALLBACK=0`, `scripts/ypsnr_de00.py`. Matched the filed table to
+four decimals on all six subsampled q=100 points, so the filing was measuring what it claimed.
+
+### The instrument that found it
+
+Not a metric — a **profile**. `dE00` says how wrong, not where. Grouping mean |Co error| by
+Chebyshev distance from the origin of the chroma plane's own 256x256 tile separates the
+candidates in one run, because only one of them has a shape:
+
+| distance from tile origin | 0 | 1–3 | 4–15 | 16–63 | 64–127 | 128–191 | 192–255 |
+|---|---|---|---|---|---|---|---|
+| bbb 4:2:2 **q=100, before** | 0.40 | 0.56 | 1.39 | 2.55 | 4.35 | 5.79 | **6.38** |
+| bbb 4:2:2 q=99, control | 0.60 | 0.34 | 0.35 | 0.36 | 0.36 | 0.35 | **0.35** |
+| bbb 4:2:2 **q=100, after** | 0.40 | 0.24 | 0.25 | 0.26 | 0.26 | 0.25 | **0.25** |
+
+A 16x ramp that resets at a tile boundary is a DPCM chain, and there is exactly one in the
+pipeline. `chroma_downsample.wgsl` box-averages 2 samples (4:2:2) or 4 (4:2:0), so the plane is a
+multiple of 0.5 or 0.25 — fractional; the step-1 quantiser rounds the residual; and
+`med_predict.wgsl` is **open-loop on purpose** ("at lossless the encoder's reconstruction is its
+input"), which holds only while coding is exact. Encoder predicts from `src`, decoder predicts
+from its own reconstruction, error accumulates until the tile resets it.
+
+This is **BUG-45's mechanism arising inside the pipeline** rather than from the caller's samples —
+which is why its guard (`source_is_integral(rgb_data)`) never fired: PNG input is integral, and
+the fractions are manufactured three stages later.
+
+**Cross-check that split the rounding from the amplification:** the lossless 5/3 arm (`GNC_MED=0`)
+was 0.9640 dE00 against a 0.7482 floor on bbb 4:2:2 — wrong, but **flat** (0.88–0.97 across the
+tile). Same rounding, no DPCM chain to compound it. So the fix belongs at the downsample, where it
+serves both transforms, not inside MED.
+
+### The fix
+
+Round the averaged plane to integers when `is_lossless()` — `round_output` on
+`ChromaResampleParams`, reached via `ChromaResampler::dispatch_with_rounding`. Canary:
+`chroma_downsample: … rounded=true` at q=100, `rounded=false` at q=90, verified on both.
+No generation bump — the decoder is untouched and old files decode to the same pixels.
+
+### After, on three stills (`GNC_LOSSLESS_FALLBACK=0`, dE00 mean / p95, Y-PSNR in YCoCg-R)
+
+| still | fmt | q=99 dE00 | q=100 **before** | q=100 **after** | predicted floor | Y q=100 before → after | q=100 bytes |
+|---|---|---|---|---|---|---|---|
+| blue_sky | 4:2:2 | 0.1145 | 2.3066 / 7.3581 | **0.0792 / 0.5846** | 0.0792 / 0.5846 | 65.24 → **70.35** dB | 1 843 999 → 1 780 758 (−3.43%) |
+| blue_sky | 4:2:0 | 0.1393 | 1.9488 / 5.7420 | **0.0996 / 0.6250** | 0.0996 / 0.6250 | 64.18 → **66.98** dB | 1 518 089 → 1 516 299 (−0.12%) |
+| kristensara | 4:2:2 | 0.1398 | 2.1422 / 5.6486 | **0.0976 / 0.7062** | 0.0976 / 0.7062 | 63.54 → **71.69** dB | 788 652 → 764 860 (−3.02%) |
+| kristensara | 4:2:0 | 0.1599 | 1.8875 / 4.8499 | **0.1116 / 0.7308** | 0.1116 / 0.7308 | 66.89 → **70.98** dB | 658 093 → 654 779 (−0.50%) |
+| bbb | 4:2:2 | 0.7354 | 2.7226 / 6.5746 | **0.7482 / 2.3472** | 0.7482 / 2.3472 | 57.40 → **68.16** dB | 2 348 848 → 2 272 845 (−3.24%) |
+| bbb | 4:2:0 | 0.9601 | 2.5567 / 6.1459 | **0.9648 / 3.2061** | 0.9648 / 3.2061 | 59.91 → **64.58** dB | 1 835 951 → 1 826 534 (−0.51%) |
+
+**The "predicted floor" column was computed before the fix was written**, by an independent CPU
+model in numpy — YCoCg-R, box average, round, nearest upsample, inverse — and every measured
+after-figure equals it to four decimals. Comparing the decoded PNG against that model image
+directly: **dE00 0.0000 and max absolute RGB error 0, on 6 of 6 points**, against 25 and 19 before.
+The lossless 5/3 arm is exact too. So this is not "much better"; it is the codec being bit-exact
+for the plane it codes, and the residual dE00 is the subsample, which is lossy by definition.
+
+**Success criteria, against the item's own wording:**
+
+- *4:2:2 never worse than 4:2:0 at q=100* — **3 of 3, the inversion is gone.**
+- *Luma must stay better at q=100 than q=99* — **6 of 6**, and by 9.8–13.6 dB rather than the
+  previous 0.9–6.9.
+- *q=100 dE00 no worse than q=99* — **4 of 6.** On bbb it is worse by **0.0128 (4:2:2)** and
+  **0.0047 (4:2:0)**, ~1.7% and ~0.5%. Reported rather than rounded away: q=100 now sits *on* the
+  subsampling floor and cannot go below it, while q=99's quantisation happens to blunt the
+  nearest-neighbour upsample slightly on that one image. That is the upsample filter's business,
+  not the lossless path's, and it is a separate item.
+
+**Lossy output does not move**: every q=95 and q=99 row, and q=100 4:4:4, is byte-identical before
+and after. All 201 unit tests plus every integration test pass; both clippy gates clean.
+
+### Regression guard
+
+`tests/bug49_subsampled_lossless.rs` asserts the *shape*, not a recorded number: far-corner error
+over near-origin error must stay under 1.5. Mutation-tested by deleting the `round` — 2.25x (4:2:2)
+and 1.98x (4:2:0) with the bug, 0.98x and 0.99x with the fix.
+
+**Two synthetics failed to detect the bug before the third one did, and both failures are the
+lesson.** Per-pixel colour noise buried a ~4-level drift under ~5.5 levels of subsampling error —
+the instrument was swamped by the thing it sat on. An `(x&1)` dither then made *every* box average
+exactly 0.5, so every MED residual was integral and the plane coded exactly even with the bug
+present: a test picture can be too clean to be wrong. What works is a 3-bit dither, which makes the
+fractional parts **vary** — that, not merely being fractional, is what the defect needs.
+
+### Not done, deliberately
+
+`0078` refused the RATE-2 lossless fallback at non-444 *because of this bug*, so its premise is
+void. Taking it off is **RATE-5**, not this item: on 2 of 6 points the bit-exact candidate wins
+rate and ~10 dB of luma while giving back 0.5–1.7% of dE00 — a trade, where RATE-2's rule wants an
+outright win — and the fallback has never once run at non-444, so RATE-3's ordering side channel
+(9.83 dB and +40.55% when it went wrong at 4:4:4) is unverified in that format. The refusal's
+*message* was corrected in place: it still claimed q=100 is "not lossless even in luma", which
+`0078` had already withdrawn.
+
+Decision record: `docs/decisions/0080`.
+
+---
+
+## 2026-09-10 — BUG-45: q=100 was never lossless on Y4M, and the encoder said so on every frame
+
+**How it was found: a person opened the web player and said the picture flickered.** Not a test,
+not a sweep — the demo set built that afternoon, watched in a browser. The report was "q=100 is
+broken, it flickers in tiles, and it moves sideways". Both halves of that turned out to name the
+mechanism exactly.
+
+**First conclusion, and it was wrong in a useful way.** The natural suspect was the browser: q=100
+is the only rung using MED, whose decoder (`med_reconstruct.wgsl`) is the codec's one serial
+dependency — 511 anti-diagonals with a `storageBarrier()` between them, one workgroup per tile.
+A backend-specific barrier defect would look exactly like tile-shaped flicker. **It reproduces on
+the CLI.** The browser and the WASM decoder are faithful; they were rendering what was in the file.
+
+### The measurement
+
+`benchmark-sequence -i bbb.y4m -n 8 -k 8 -q 100`, before:
+
+```
+PSNR:  avg 32.89 dB  min 32.48  max 33.16  stddev 0.22
+BPP:   avg 8.4193
+```
+
+**32.89 dB from the bit-exact mode.** The 0.68 dB spread across eight frames is the flicker: at
+this operating point LOSSLESS-2 re-codes every P-frame as an I-frame (+110% for P here), so each
+frame carries an independent drift pattern and the loop cycles through eight different pictures.
+
+And on every one of those frames the encoder printed BUG-45's warning — *"non-integer input
+samples … NOT bit-exact"*. It had been printing it for the life of the feature.
+
+### Cause
+
+Not the chroma upsample, which was the first guess and is worth recording as wrong: `Y4mReader`
+maps 4:2:0 chroma with `col/2`, which is integral. It is the **colour matrix**. BT.601
+limited-range is `1.164*(Y-16)` plus 1.596/0.392/0.813/2.017 — no integer coefficient anywhere —
+so **every Y4M frame is fractional, `C444` included**. Counted by the new canary: **6 150 134 of
+6 220 800 samples per frame, 98.9%.**
+
+From there it is `0080`'s mechanism with a different producer. Step-1 quantiser rounds the
+residual; `med_predict.wgsl` is open-loop on purpose; encoder predicts from `src` and decoder from
+its reconstruction; the error accumulates along each tile's diagonal wavefront. Tile-shaped,
+because the chain resets per tile. Moving sideways, because the wavefront runs diagonally.
+
+**BUG-45's own filing said this was unreachable except from an API caller** — *"PNG and Y4M input
+is integral"*. The PNG half is true. The Y4M half is why this sat at P3 while being the defect
+that makes the flagship mode not do what it says on the most common video input format there is.
+
+### Fix and result
+
+Round the source to integers in `encode_once` when `config.is_lossless()`, replacing the warning.
+`0078` and BUG-45 both argued against normalising — *"cannot be normalised without changing the
+picture"* — but that weighs rounding against keeping the picture, and keeping the picture was never
+what the alternative delivered. Full argument in `docs/decisions/0081`.
+
+| Y4M, 8 frames, ki=8, q=100 | bytes | PSNR |
+|---|---|---|
+| bbb, **before** | 17 458 361 | **32.89 dB** |
+| bbb, after | 21 600 670 | **inf** |
+| blue_sky, after | 18 234 795 | **inf** |
+| crowd_run, after | 26 381 563 | **inf** |
+| old_town_cross, after | 25 538 510 | **inf** |
+
+SSIM 1.0000, max PSNR drop 0.00 dB, four of four. **Rate rises 23.7% on bbb** — the honest price;
+the smaller file was smaller because it was throwing the picture away, so that comparison was never
+valid, and every q=100 rate figure taken from Y4M before today is superseded.
+
+**Lossy is byte-identical**, checked against demo artefacts produced by the *previous* binary —
+q=25 1 153 801, q=50 2 352 009, q=75 6 190 783 — which is a real before/after rather than an
+argument from where the `if` sits.
+
+Guard: `tests/bug45_fractional_source_lossless.rs`. Mutation-tested — removing the rounding gives
+**max abs error 134** on a 0–255 scale while the integral-source control keeps passing.
+
+### What this says about how the session verified BUG-49 that morning
+
+`0080` was verified end to end on **PNG stills**, which are integral by construction. Nothing in
+that verification could have reached the Y4M path, and `0080` even records "BUG-45 … this record
+does not close it" as a known remainder. It turned out to be the larger half, and it took about ten
+seconds of a person watching a video to surface what a day of measuring on stills did not.
+**A bit-exactness claim is only as broad as the input formats it was taken on**, and the log now
+has one instance of that costing a shipped defect and one of it being caught by a viewer.
+
+Filed: **LOSSLESS-4** — q=100 from Y4M is bit-exact against the *converted RGB*, not the file's
+original Y'CbCr. The BT.601 matrix is not integer-invertible, so "lossless" is narrower for Y4M
+input than for PNG input and nothing in the CLI says so.
+
+---
+
+## 2026-09-10 — The browser path is verified, on two independent WebGPU implementations
+
+**What was run.** `examples/web/player.html`, served over `http://localhost` (a secure context, so
+WebGPU needs no certificate), driving the `wasm-pack --release` build of the library — 628 KB of
+`gnc_bg.wasm`. Watched by the project owner in **Chrome and Safari on macOS**. Those are not two
+builds of one engine: Safari's WebGPU is WebKit's own implementation, not Dawn, so this is the same
+shape of evidence as the Vulkan result — a second implementation agreeing with the first.
+
+**What it exercised:**
+
+- **Both containers** — GNV1 (I+P) and GNV2 (the Haar temporal wavelet).
+- **The whole quality ladder** — q=25 through q=100, including the MED lossless path, which is the
+  only rung with a serial dependency in its decoder (`med_reconstruct.wgsl`, 511 anti-diagonals
+  with a `storageBarrier()` between them, one workgroup per tile).
+- **All three chroma formats** — 4:4:4, 4:2:2, 4:2:0.
+- **A full-length film** — 14 315 frames of 1080p in 20 segments, played end to end with the
+  player's auto-advance.
+
+**Play rate, and read it as what it is.** The page's own timing display reported roughly **150 fps
+on the short 1080p clips and 120 fps on crowd_run and old_town_cross**. That is a decoder keeping
+far ahead of any real frame rate, which is the useful conclusion. It is **not a throughput figure**:
+it was read off a page on a machine with eight sessions live, and BASELINE's rule about non-idle
+runs applies to browsers as much as to `benchmark-sequence`. Nobody should quote it as a benchmark.
+
+### What the documentation said, and why it was wrong twice over
+
+README carried *"the browser path has never been verified in a browser"* as a headline defect, and
+this session repeated it back to the owner as fact. The correction came from the person who had
+actually run it. **Two separate errors were sitting in that one sentence:**
+
+1. **Too broad.** What the log actually recorded (2026-09-07) was narrower and correct at the time:
+   *"Verified: WASM builds, its four exports match what both pages import, all ten bitstreams decode
+   through the CLI, both pages' modules parse … **Not verified: an actual browser render**"* — a
+   statement about that afternoon's freshly-built demo set, not about the decoder's whole history.
+   README generalised it into a claim about the feature, and GOALS repeated the generalisation.
+2. **Stale.** GOALS §1 said the WASM path had *"one known limit breach (BUG-31)"*. BUG-31 was fixed
+   on 2026-09-08. The remaining breach is BUG-35's, it is **encode**-side, and it is worse in kind:
+   `quantize_histogram_fused.wgsl` is on the *default* encode path at 23 800 B against a 16 384 B
+   guarantee, where BUG-31's was an opt-in coder's. The doc named the closed bug and missed the open
+   one, in the milder direction.
+
+The same-day lesson from BUG-45 is one layer up from this: a claim is only as broad as what it was
+taken on. Here the claim was *narrower* than the sentence carrying it, which fails the other way —
+the project talked itself out of a capability it had.
+
+### Still not verified, and none of it is implied by the above
+
+- **Browser encode.** Not merely untested — currently impossible, and the encoder is not exposed to
+  JS anyway. BUG-35. GOALS rule 4 does not distinguish encoder from decoder, so rule 4 is
+  three-quarters met, not met.
+- **Any non-Apple GPU in a browser**, and any browser on Windows or Linux. Both engines tested here
+  sit on Metal. A conformant-but-stricter device is exactly what BUG-35 would catch.
+- **DX12**, which still has not produced a frame (BUG-52).
+
+Documentation updated: README's portability bullet and a new "Web player" section, GOALS §1 and
+rule 4 and the feature list, `docs/POSITIONING.md`'s in-browser-decode line.
+
+---
+
+## 2026-09-11 — Did fixing lossless cost us the FFV1 comparison? No. It exposed a bigger one.
+
+**The question, from the project owner:** now that BUG-45 raised the Y4M lossless rate 23.7%, is
+GNC still competitive? Reasonable suspicion, and the answer is two-part.
+
+**The published comparison did not move, and that is checkable rather than arguable.** The standing
+FFV1 result was taken *"on the same four PNGs"* (RESEARCH_LOG, "The FFV1 gap, measured today rather
+than carried forward"). PNG samples are integral, so `0081`'s rounding — which only fires on a
+fractional source — cannot reach that arm. Verified byte-identically: `bbb_1080p.png` at q=100
+encodes to **3 235 737 bytes** both before and after the fix, across both of the weekend's lossless
+changes.
+
+**But the arm nobody had published is much worse.** Eight frames of `bbb.y4m`, every row lossless
+and bit-exact for the signal it codes:
+
+| arm | bytes | vs FFV1 native | vs FFV1 gbrp |
+|---|---|---|---|
+| **FFV1 native** (`yuv420p` — codes the file's own samples, returns them exactly) | 10 056 857 | — | −39.1% |
+| **FFV1 gbrp** (converted to RGB first, exactly as GNC does) | 16 515 377 | **+64.2%** | — |
+| GNC q=100, Rice (default) | 21 600 670 | +114.8% | +30.8% |
+| **GNC q=100, `--abac`** | 17 972 947 | +78.7% | **+8.8%** |
+
+**Two comparisons, two meanings, and quoting either alone misleads** — the same rule CLAUDE.md
+already carries for the x264 luma/chroma split, arriving from a different direction.
+
+- *Codec against codec, same signal:* **+8.8%** with abac. That independently reproduces the
+  published **+7.3%** on stills, on different content and through a different input path. The
+  entropy-coding gap is real, small, and now confirmed twice.
+- *Product against product, same file:* **+78.7%**. This is what a user with a Y4M file sees.
+
+**The 64.2 points between those two rows are colour conversion, paid before GNC codes anything.**
+That is **seven times** the entropy-coding gap and the largest single item in the lossless picture.
+Two mechanisms: BT.601's 1.164 gain manufactures levels that were never in the 8-bit source, and
+full-resolution RGB carries chroma detail the 4:2:0 file never had. FFV1 pays it too when told to
+(`-pix_fmt gbrp`, +64.2%) — it is not a GNC defect, it is a consequence of coding RGB at all.
+
+**So the honest summary is that the suspicion was right about the wrong thing.** The fix did not
+make GNC worse; it removed a comparison that was never valid, and measuring the replacement showed
+the rate story on video ingest is dominated by something that is not the entropy coder. Every
+effort spent on the abac gap buys at most ~8% of today's output; a native Y'CbCr path buys ~39%
+and fixes LOSSLESS-4's correctness complaint in the same change.
+
+**Correction, 2026-09-11.** An earlier version of this paragraph said the native path "buys ~64",
+comparing a +64.2% *cost* against a +8.8% *cost* — percentages of two different denominators.
+Expressed against the same baseline, today's output: the native path removes **39.2%**, closing the
+entropy gap removes **8.1%**, so it is worth about **4.8x**, not seven times. Still the largest item
+on the board; the mis-statement was in the arithmetic of comparing them, not in which one wins.
+
+**LOSSLESS-4 re-priced P2 → P1** on this measurement. PERF-3 item 2 (packed-u8 YUV upload, 4x less
+DMA and no CPU colour) wants the same input path for an unrelated reason, which is worth knowing
+before either is designed.
+
+---
+
+## 2026-09-11 — LOSSLESS-4: the still path codes Y'CbCr natively, −39.2% end to end
+
+Built in four stages behind a generation bump, each verified before the next.
+
+**Stage 1 — GP21.** A colour-space byte next to GP13's chroma byte, gated on `gen >= 21`; older
+generations decode as YCoCg-R, which for them is not a default but the only thing they could have
+been. An unknown byte panics rather than falling back: a wrong colour space is a plausible wrong
+picture, `0074`'s failure mode. **GP20 is skipped on purpose** — it is written on unmerged tile1
+work and held as `gen-20`, so taking the next number by inspection would have been BUG-51 twice.
+
+**Stage 2 — `EncodeInput`.** `Rgb` pads on the GPU, converts, deinterleaves, subsamples. `Planes`
+does none of those four. Padding moves to the CPU for a planar source because that source arrives
+there anyway — one pass over data about to be uploaded, against the 25 MB interleaved buffer the
+same frame used to build.
+
+**Stage 3 — the decoder stops inverting a transform that never happened.** Two buffer usages had to
+widen for the copy that replaces it.
+
+**Stage 4 — the CLI reads Y4M planes.** `gnc encode -i clip.y4m` now codes them directly;
+`GNC_RGB_PATH=1` forces the old arm.
+
+### The number, end to end through the tool
+
+| sequence, frame 0, q=100 | RGB path | planar | delta |
+|---|---|---|---|
+| bbb | 2 699 215 | 1 604 025 | **−40.6%** |
+| blue_sky | 2 270 626 | 1 291 127 | **−43.1%** |
+| crowd_run | 3 281 233 | 2 068 733 | **−37.0%** |
+| old_town_cross | 3 192 704 | 1 994 249 | **−37.5%** |
+| **mean** | 11 443 778 | 6 958 134 | **−39.2%** |
+
+**Identical to the spike, sequence for sequence.** The estimate was taken before any code was
+written, by coding each plane separately as a grayscale image — `Co = R−B = 0` and `Cg = 0` exactly,
+so the two empty planes cost 3 191 B and the luma plane goes through the normal path. Predicting the
+shipped number to the byte is the strongest argument that neither the estimate nor the
+implementation is doing something unintended.
+
+### Three things that went wrong, all mine
+
+**A commit message claimed both clippy gates were clean when they were not.** I ran the gates in the
+same command as the commit rather than before it. Two warnings, one of which was dead scaffolding
+(`unused_marker`) left over from restructuring. Fixed and the commit rewritten before pushing — but
+the lesson is that a gate run *after* `git commit` in the same line is not a gate.
+
+**The BUG-51 guard went blind and reported success.** It found what the writer stamps by scanning
+`format.rs` for `out.extend_from_slice(b"GP..`. Switching the writer to a `CURRENT_MAGIC` constant
+made that scan match nothing — a guard that passes because it stopped looking. It now follows the
+indirection and checks both links. Worth generalising: **every guard that locates its subject by
+matching source text can be silenced by a refactor that is otherwise correct.**
+
+**The `GNC_RGB_PATH=1` escape hatch could not run.** `gnc encode` never read Y4M before, so forcing
+the RGB arm fell through to an image loader that refuses the extension — an A/B with one arm, which
+is the shape of several retracted results in this log. The forced arm now does the conversion
+itself.
+
+### Stopped deliberately, at the half that matters most
+
+The planar path is in the **still** encoder. Video goes through `sequence.rs`, which has **nine**
+separate `color.dispatch` sites across I/P/B, streaming and not, temporal-wavelet and not — in a
+file ARCH-4 already records as 7 590 lines in one impl block and as where the reference bugs live.
+Branching nine sites by hand on the same afternoon the still path was verified is how a measured win
+becomes an unmeasured regression. **LOSSLESS-5**, which says to do the shared-preprocessing part of
+ARCH-4 first so the branch is written once instead of nine times and deleted eight.
+
+
+---
+
+## 2026-09-11 — LOSSLESS-5 step 1: eleven copies of the same two dispatches become one
+
+**The count in the filing was wrong, and the way it was wrong is the point.** LOSSLESS-5 said the
+sequence encoder had *nine* colour-transform sites. It had **eleven**. The nine came from a `grep`
+truncated by `head -40`, and I repeated it in a backlog entry, a commit message and three answers
+without re-deriving it. Nothing downstream depended on the number being nine — but that is luck, not
+process, and it is the same class of unverified figure this log keeps retracting.
+
+The refactor found all eleven because it **parsed** the calls instead of matching lines: locate
+`self.color.dispatch(`, balance parentheses, require `self.deinterleaver.dispatch(` next, split the
+arguments, and assert before rewriting — argument counts, that the colour step writes to the buffer
+the deinterleave reads, and that both use the same command encoder. Eleven sites, eleven passes.
+
+`preprocess_to_planes` now holds those two dispatches. The copies differed only in buffer set,
+command-encoder name, and where the planes landed.
+
+**Gate: 32 runs, every md5 unchanged.** Four clips x {q=50, q=100, ki=2}, plus haar, no-temporal,
+abac and 4:2:0 arms, each with the B-pyramid on and off — chosen to reach as many of the eleven as
+the CLI can. Captured *before* the edit, which is the only order in which the gate means anything.
+28 test suites green, both clippy gates clean, the file 23 lines shorter.
+
+**A suspicion withdrawn.** One site passed `reversible = true` unconditionally where the others
+computed it, and I raised it as "either deliberate or a latent bug". It is deliberate: the encoder is
+labelled `local_decode_ref_from_source`, and a bit-exact frame's reference is built from the source,
+so the reversible transform is the right one there. Worth having raised only because ten
+near-identical neighbours made it unreadable either way; now it is one argument with a reason
+attached.
+
+**Why this before the feature.** Branching eleven sites by hand would have meant writing the same
+decision eleven times and deleting ten. It now needs making once — and the byte-identity gate means
+any later regression in video lossless cannot be blamed on this step, because this step provably
+changed nothing.
+
+
+---
+
+## 2026-09-11 — The −39%/−40% headline was two changes added together; the colour space is worth ~13%
+
+**Caught before building on it, and it is the third number of mine to need correcting today.**
+
+Both LOSSLESS-4's −39.2% (stills) and LOSSLESS-5's −40.6% (video) compared the native planar path
+against an RGB encode at **4:4:4** — from a **4:2:0** source. That baseline upsamples chroma to full
+resolution before coding it, which no one would do. The comparison therefore contained a
+chroma-format change as well as a colour-space change, and credited all of it to the colour space.
+
+The missing middle arm, measured on the same 8-frame clips at q=100:
+
+| | RGB 4:4:4 | RGB 4:2:0 | native planar | format | colour space |
+|---|---|---|---|---|---|
+| bbb | 21 600 670 | 14 037 096 | 11 638 621 | −35.0% | −17.1% |
+| blue_sky | 18 234 795 | 12 177 977 | 10 306 794 | −33.2% | −15.4% |
+| crowd_run | 26 381 563 | 18 597 134 | 16 634 584 | −29.5% | −10.6% |
+| old_town_cross | 25 538 510 | 17 940 288 | 15 906 563 | −29.8% | −11.3% |
+| **mean** | 91 755 538 | 62 752 495 | 54 486 562 | **−31.6%** | **−13.2%** |
+
+**FFV1 decomposes identically**, which is what turns this from an argument into a measurement: same
+8 frames, `yuv420p` 10 056 857 → `yuv444p` 13 648 989 → `gbrp` 16 515 377. The "+64.2% penalty for
+being told to code RGB" published here yesterday is **+35.7% chroma format and +21.0% colour
+space**. The colour conversion costs a fifth, not two thirds.
+
+### What survives
+
+**The colour-space prize is ~13%.** Still worth building — it is larger than closing the entropy
+gap to FFV1 entirely (8.1%) — and the correctness half does not depend on the rate at all: a
+Y'CbCr source getting its own samples back is either true or it is not. The shipped code is
+unaffected; `gnc encode` on a Y4M uses the file's own chroma format *and* colour space, both
+improvements on not being able to read Y4M at all. **What was wrong was the attribution.**
+
+### The pattern, which is worth more than the correction
+
+Three of my own figures needed correcting today: a +64.2% *cost* compared against a +8.8% *cost* as
+though they shared a denominator; "nine" preprocessing sites that were eleven, from a `grep`
+truncated by `head`; and now a headline that was two effects summed. None was caught by a test,
+because none of them was a bug in the codec — they were bugs in the comparison. **The measurements
+were being produced faster than they were being controlled.**
+
+The specific habit that would have caught all three: *before quoting a delta, name what the other
+arm is and why it is the right one.* The 4:4:4 baseline fails that question immediately — nobody
+codes a 4:2:0 source at 4:4:4, so it was never the arm to beat.
+
+---
+## 2026-09-14 (round 4) -- the DXC fix works, DX12 clears the compile wall, and hits a 32 KB groupshared overflow
+
+Same Windows laptop (Intel Arc Pro + NVIDIA RTX 2000 Ada, 31.5 GB). Built from **8ebfd9e** plus one
+local, env-gated change: the device `wgpu::Instance` in `src/lib.rs` now takes
+`backend_options: wgpu::BackendOptions::from_env_or_default()`, so `WGPU_DX12_COMPILER=dxc` selects
+DXC. Unset, it is FXC -- the default is unchanged. `dxcompiler.dll` and `dxil.dll` (x64) were copied
+next to the exe from the Windows SDK (`10.0.26100.0\x64`); no download.
+
+This tests **BUG-52's candidate fix** end to end. Round 3 left DX12 dying in a >4.5-min FXC compile;
+the reviewer's diagnosis was that GNC has always used wgpu's default DX12 compiler, FXC ("old, slow,
+unmaintained"), and that DXC would compile the same shaders in seconds. Both halves check out.
+
+### DXC clears the compile wall -- BUG-52's fix is correct
+
+`benchmark -i bbb -n 3 -q 90`, `GNC_GPU_BACKEND=dx12`, `WGPU_DX12_COMPILER=dxc`:
+
+| GPU | compiler | wall to first error/exit |
+|---|---|---|
+| NVIDIA RTX 2000 Ada | FXC (round 3) | **>4.5 min, killed, no output** |
+| NVIDIA RTX 2000 Ada | **DXC** | **14.7 s** |
+| Intel Arc Pro | **DXC** | **17.5 s** |
+
+DXC compiles GNC's shader set in seconds where FXC did not finish in minutes. The candidate fix in
+BUG-52 -- switch to DXC, ship the two DLLs -- is verified. It should land; env-gating it costs
+nothing and lets the next session reach DX12 with one variable.
+
+### ...and DX12 hits the next wall: a shader over the 32 KB threadgroup limit
+
+DXC does not produce a frame either, but it fails **fast and specifically** where FXC failed slow and
+opaquely. Identical error on both GPUs:
+
+```
+DXC validation error: Total Thread Group Shared Memory storage is 33816, exceeded 32768.
+```
+
+The shader is **`rans_normalize_encode_fused.wgsl`**. Its groupshared declarations:
+
+| declaration | bytes |
+|---|---|
+| `shared_freq: array<u32, 4096>` | 16384 |
+| `shared_cumfreq: array<u32, 4096>` | 16384 |
+| `shared_sum: array<u32, 256>` | 1024 |
+| 8 scalar `u32` (w_total, w_assigned, ...) | 32 |
+| **total** | **~33824** (validator reports 33816) |
+
+The two 4096-entry frequency/cumulative-frequency arrays alone are exactly 32 KB; the histogram sum
+and scalars push it over DX12's hard **32768 B** threadgroup limit. This is a static property of the
+shader, not a driver quirk -- hence byte-identical failure on NVIDIA and Intel.
+
+**Two things worth recording.** First, this shader also exceeds **GNC's own requested workgroup
+budget** -- CLAUDE.md's Platform Notes say GNC asks wgpu for a 16384 B workgroup-storage limit, and
+this shader wants 33816. It is over budget by 2x; Vulkan/naga-SPIR-V and Metal simply never enforced
+it, and only DXC's DXIL validator does. Second, it compiles eagerly at device creation, so it blocks
+DX12 for **every** coder including the default Rice path, not just `--rans`. Tested directly:
+`benchmark-sequence --abac` on DX12+DXC fails with the *same* 33816 > 32768 error before the first
+frame -- picking a different entropy coder does not avoid a pipeline that is built unconditionally.
+
+### Where DX12 now stands -- three walls, each fix exposing the next
+
+| round | commit | DX12 blocker |
+|---|---|---|
+| 2 | f17bf1b | FXC compile **error** X3695 (race) in `block_match_bidir.wgsl` -- BUG-40 fixed |
+| 3 | f90f94d | FXC compile **time** wall, >4.5 min -- BUG-52; DXC fixes it (this round) |
+| 4 | 8ebfd9e | DXC **validation**: `rans_normalize_encode_fused.wgsl` groupshared 33816 > 32768 |
+
+DX12 has still never produced a frame, but the reason is now a single named shader over a documented
+limit rather than an unbounded compile. **The cheapest path to GNC's first DX12 frame** is probably
+to make the rANS encode pipelines lazy the way BUG-40 made the bidir MC pipelines lazy (`0049`): the
+default Rice benchmark does not use `rans_normalize_encode_fused` at all, so if that pipeline is not
+built until `--rans` dispatches it, a still Rice encode on DX12 should compile and run. Failing that,
+the shader itself has to fit 32 KB -- the two 4096-entry arrays need not both be resident, or the
+alphabet can be tiled. Not chased this round; it wants its own item.
+
+### State
+
+- **BUG-52 DXC fix: VERIFIED.** FXC->DXC removes the compile wall (14.7 s / 17.5 s vs >4.5 min).
+  The env-gated change is kept in `src/lib.rs`; default behaviour (FXC) is unchanged.
+- **New DX12 blocker:** `rans_normalize_encode_fused.wgsl` declares 33816 B of threadgroup shared
+  memory, over DX12's 32768 B limit and over GNC's own 16 KB request. Needs its own bug number.
+  Blocks DX12 for all coders because it compiles eagerly.
+- **DX12 still produces zero frames**, now for a groupshared-size reason. First-frame path: make
+  rANS pipelines lazy (per 0049), or shrink the shader's groupshared.
+- **Unchanged:** CANARY-1 (2.01x), inter works, MEAS-5 inter 1.85x@N=4, NVENC driver-blocked.
+
+### ...and then the first DX12 frame -- the fused pipeline was eager dead weight
+
+The groupshared blocker fell in one change, and the change taught something. Following 0049, the
+fused rANS pipeline was made lazy: `fused_norm_enc_pipeline` in `rans_gpu_encode.rs` is now a
+`OnceLock` built by an accessor on first dispatch, not in `new`. The shader module and pipeline
+layout stay eager (neither compiles backend code); only `create_compute_pipeline` -- the step DXC's
+DXIL validator runs -- is deferred.
+
+**The discovery in doing it: `encode_3planes_fused` has zero call sites.** The default rANS path
+dispatches `encode_3planes_skip_histogram` / `encode_3planes_to_tiles`, never the fused variant. So
+the 33 KB shader was compiled eagerly in `new` and *never dispatched by anything* -- pure eager dead
+weight that only DX12's validator ever objected to. Making it lazy removes it from every real path.
+
+**Result: GNC encodes on DX12 for the first time.** `benchmark -i bbb -q 90`,
+`GNC_GPU_BACKEND=dx12 WGPU_DX12_COMPILER=dxc`:
+
+| adapter | backend | exit | bytes | PSNR | encode | decode |
+|---|---|---|---|---|---|---|
+| NVIDIA RTX 2000 Ada | DX12 | **0** | 1869134 | 49.89 | 31.97 ms | 21.29 ms |
+| Intel Arc Pro | DX12 | **0** | 1869134 | 49.89 | -- | -- |
+| NVIDIA RTX 2000 Ada | Vulkan | 0 | 1869134 | 49.89 | ~17 ms | -- |
+| Intel Arc Pro | Vulkan | 0 | 1869134 | 49.89 | -- | -- |
+
+**Byte-identical across all four** (2 backends x 2 vendors): 1869134 bytes, PSNR 49.89. DX12's output
+matches Vulkan's exactly. rANS on DX12 works too (`--rans -q 50`: 669465 bytes, byte-identical to
+Vulkan) -- because the default rANS path never touches the fused shader, and the pipelines it does
+use (histogram, normalize, encode, encode_lean) are all under 32 KB.
+
+DX12 is slower than Vulkan on the same card (~32 ms vs ~17 ms encode on the RTX 2000 Ada) -- not
+chased; the point of this item was a *frame*, and portability before speed.
+
+**Verified:** native clippy clean, `--lib` wasm clippy clean, 39 rANS unit tests pass, and rANS
+still encodes correctly on Vulkan (unchanged output). The env-gated DXC change and this laziness
+change are both in.
+
+**What this leaves.** GOALS rule 4 claims DX12, and for the first time GNC meets it -- intra, Rice
+and rANS, on two vendors, byte-identical to Vulkan. `encode_3planes_fused` and its shader are now
+confirmed dead code reachable from no encode path; a follow-up could delete them outright rather than
+keep a lazy pipeline nothing calls. Inter (B-frame) on DX12 is still untested -- `block_match_bidir`
+(BUG-40) may have its own DX12 story. And DX12 needs `dxcompiler.dll` + `dxil.dll` shipped, which the
+release process does not yet do.
+
+### State (updated)
+
+- **DX12: RUNS.** First GNC frame on DX12, both GPUs, byte-identical to Vulkan, Rice and rANS. The
+  two changes: env-gated DXC (`WGPU_DX12_COMPILER=dxc`), and the fused rANS pipeline made lazy.
+- **BUG-52: resolved** -- FXC compile wall gone (DXC), and the groupshared overflow it exposed is
+  gone too (the overflowing shader was never dispatched; lazy creation removes it from the path).
+- **Follow-ups:** delete the dead `encode_3planes_fused` + shader; ship the DXC DLLs in the release;
+  test inter on DX12; DX12 vs Vulkan speed (~2x slower) if it ever matters.
+
+### Inter on DX12 -- P and B both run, and BUG-40 step 2 is retired by DXC
+
+Follow-on to the same day: does inter work on DX12, and are B-frames (`block_match_bidir.wgsl`,
+BUG-40 step 2's open FXC X3695) usable? `clip420_60.y4m`, q=90, Rice, `WGPU_DX12_COMPILER=dxc`.
+
+**P-frames (`-k 9`, 1I+8P):** run on both GPUs, exit 0.
+
+| GPU | backend | total bytes |
+|---|---|---|
+| NVIDIA | Vulkan | 3450781 |
+| NVIDIA | DX12 | 3450788 |
+| Intel | DX12 | 3450265 |
+
+Not byte-identical across backends (7 B NVIDIA, ~500 B Intel) -- expected: the lossy inter path's
+motion search is float work whose HLSL and SPIR-V codegen differ, the same reason the lossy intra
+encoder is not byte-exact across backends. Intra was byte-identical because its integer path is; the
+inter divergence is small and in the noise the encoder already carries.
+
+**B-frames (`GNC_B_PYRAMID=1`, 1I+1P+7B):** also run on both backends, exit 0, no crash.
+`block_match_bidir.wgsl` compiles under **DXC** where it failed FXC with X3695 (BUG-40 step 2) --
+**so DXC retires BUG-40 step 2 the same way it retired the intra compile wall.** DX12 reproduces
+Vulkan's B-frame output nearly exactly (3685055 vs 3685051 B; the middle B-frame is byte-identical
+at 387201 B).
+
+### But B-frames are defective, and it is BUG-5, on both backends
+
+The per-frame PSNR is not flat. Vulkan **and** DX12, identical numbers:
+
+| frame | type | PSNR dB |
+|---|---|---|
+| 0 | I | 59.13 |
+| 1,2,3 | B | ~59 |
+| **4** | **B** | **35.56** |
+| 5,6,7 | B | ~59 |
+| **8** | **P** | **32.61** |
+
+The codec's own temporal-consistency metric flags it: **max PSNR drop 26.23 dB, stddev 14.58 dB** --
+a 24 dB pulse on the middle B-frame is visible flicker. It is **identical on Vulkan and DX12**, so it
+is not a backend bug; it is **BUG-5** (B-frames "stop paying", pyramid off by default since
+2026-09-06, root cause an *untested* hypothesis). The mechanism is even visible in the numbers:
+frame 4 is the one B-frame that references the P-anchor at frame 8 directly, and P@8 has degraded to
+32.61 dB by ordinary P-frame accumulation; averaging a 59 dB and a 32 dB reference caps frame 4 near
+35 dB, while the other B-frames reference higher-quality neighbours. Consistent with BUG-5's
+"averaging two reconstructed references puts the prediction off" hypothesis, now with a temporal
+signature to test it against.
+
+**Net:** DX12 inter is done -- P and B both run and match Vulkan, and DXC closes BUG-40 step 2. The
+B-frame quality defect is real but pre-existing, backend-independent, and already filed as BUG-5;
+chasing its root cause is the next item.
+
+### Chasing it: the B-frame valley is not rate, not averaging -- B4's residual does not reconstruct
+
+The pulse lives on **B4**, the pyramid base. `sequence.rs:937` (#49) codes B4 as a **forward-only
+P-frame** from I0 (via `encode_pframe`), tagged `Bidirectional` with `backward_vectors=None`, so
+P8 can reference it at 4 frames instead of 8. So B4 is a long-range forward prediction, and its
+35.56 dB is byte-for-byte the quality a plain P-frame gets at 4-frame distance (ki=5 P-only frame 4
+is *also* 35.56 dB). That much looked like "B4 is just a hard P."
+
+It is not. Added an env-gated diagnostic, `GNC_B4_QSTEP_MUL`, that scales **only B4's** qstep
+(`sequence.rs`, default unset = unchanged). Finer quantisation on B4 should raise its PSNR toward
+lossless -- the residual is `source - prediction`, and coding it finely recovers `source` whatever
+the prediction was. It does not:
+
+| GNC_B4_QSTEP_MUL | B4 bytes | B4 PSNR | total bytes |
+|---|---|---|---|
+| 1.0 (default) | 387201 | 35.56 | 3685051 |
+| 0.5 | 481458 | 35.56 | 3752545 |
+| 0.25 | 575709 | 35.57 | 3839671 |
+| 0.1 | 714930 | 35.57 | 3979965 |
+
+**10x finer qstep nearly doubles B4's bytes and moves its PSNR by 0.01 dB.** The residual is being
+coded -- the bytes prove it -- and it is not reconstructing the signal. That rules out both prior
+stories: it is **not** rate allocation (more bits do nothing) and **not** BUG-5's "bidirectional
+averaging is half a step off" (the other B-frames are fine at 59 dB; B4 is coded forward-only, no
+averaging involved).
+
+**The signature of a fixed prediction mismatch.** A quality pinned against qstep is what you get when
+the decoder reconstructs B4 from a *different* prediction than the encoder subtracted: reconstruction
+becomes `decoder_pred + (source - encoder_pred) = source + (decoder_pred - encoder_pred)`, and that
+error term is independent of how finely the residual is coded. B4 is coded through the P-frame path
+but tagged `Bidirectional`; the comment at `sequence.rs:943` *asserts* the decoder "treats it as a
+P-frame (P-frame MC path)", and this measurement is the first thing to test that assertion. **Next
+step:** confirm the decoder's B4 prediction equals the encoder's forward-only one -- if it runs a
+bidirectional or wrong-reference MC for a frame the encoder coded forward-only, that is the bug, and
+it is in the decoder's frame-type dispatch, not in rate control. Filed on BUG-5 (reopened, P2); the
+`GNC_B4_QSTEP_MUL` knob stays as the canary that a fix must make responsive.
+
+**Correction, same session: that decoder hypothesis is wrong.** The decoder's frame-type dispatch is
+already correct -- `decoder/gpu_work.rs:69-78` detects a `Bidirectional` frame with
+`backward_vectors=None` (`is_fwd_only_bframe`) and folds it into `is_pframe`, running the P-frame MC
+path exactly as `sequence.rs:943` claims. So the decoder does **not** run a bidirectional or
+wrong-reference MC for B4, and "decoder_pred ≠ encoder_pred via frame-type dispatch" is retracted.
+
+The independent check that would have settled it -- a real container round-trip of B4 -- is blocked:
+`encode-sequence` prints `mode=I+P` and codes no B-frames even with `GNC_B_PYRAMID=1` (the pyramid
+lives only in `benchmark-sequence`'s throughput path), and on the extracted frames it also panicked
+(exit 101, a separate lead). So B4 cannot yet be decoded through the container and measured on its
+own.
+
+**What still stands, and what is now open.** The hard fact is unchanged and still unexplained: B4's
+PSNR is pinned against its own qstep (10× finer = +85% bytes, +0.01 dB), which is not rate and not
+averaging. With the decoder dispatch ruled out, the live candidates are narrower and both sit on the
+*measurement/encoder* side, not the decoder: benchmark-sequence may report B4 from a reference or
+prediction buffer rather than a full re-decode, or the encoder's local reconstruction of B4 (the one
+it stores as the pyramid-slot reference) may drop the residual. Distinguishing them is a code trace
+of the per-frame-PSNR path in `sequence.rs` plus fixing `encode-sequence` to emit the pyramid so a
+container decode can be compared. BUG-5 stays reopened (P2) with this corrected, narrower state; the
+`GNC_B4_QSTEP_MUL` canary stands. **No overclaim survives: the pulse is real, its cause is not.**
+
+### Traced further: B4 is genuinely broken, and reference + dispatch both match
+
+Followed the two candidates. Both narrow rather than resolve, but they rule things out.
+
+**The measurement is a full decode, not a buffer read.** `main.rs:3221` computes the printed
+per-frame PSNR as `quality::psnr(frames_data[i], decoded_all[i])`, and `decoded_all` is
+`decoder.decode_sequence(&compressed_ip)` (`main.rs:3192`) -- a real bitstream decode of the whole
+reordered sequence. So B4's 35.56 dB is source-vs-decoded on the actual container. **B4 is genuinely
+broken; the "benchmark measures a reference buffer" candidate is ruled out.**
+
+**Encoder and decoder agree on B4's reference and its MC path.** Encoder: B4 is `encode_pframe` with
+`gpu_ref_planes = I0` as sole reference (`sequence.rs:939`). Decoder: before the anchor it saves I0,
+sets `reference_planes = I0`, and decodes B4 (`decoder/pipeline.rs:743-748`), with `gpu_work` folding
+the `Bidirectional`+`backward_vectors=None` frame into the P-frame MC path (`gpu_work.rs:69-78`).
+Same reference (I0), same dispatch (forward P). So a wrong-reference or wrong-dispatch prediction
+mismatch is ruled out too.
+
+**Which sharpens the puzzle rather than solving it.** With reference and dispatch matching, encoder
+and decoder should compute the *same* prediction, and a finer residual should then close on the
+source -- yet 10x finer moves PSNR 0.01 dB. That leaves the residual round-trip for B4 specifically:
+the frame is coded through the P path but tagged `Bidirectional`, and the one place encode and decode
+still diverge by frame type is **serialisation** -- motion-vector layout (P writes forward-only, a
+Bidirectional frame's reader may expect forward+backward) or coefficient/entropy framing. That is the
+next place to look, and it needs an instrumented dump (B4's prediction, its dequantised residual, and
+its reconstruction, each compared encode-vs-decode) rather than another black-box sweep. Not guessed
+at further here. BUG-5 stays reopened (P2); the canary stands; each pass has removed a candidate
+(rate, averaging, decoder dispatch, wrong reference, mis-measurement) without yet naming the defect.
+
+### Resolved: B4 is not special — it is an ordinary forward P-frame, and forward P-frames saturate
+
+The instrumented dump was not needed; two black-box measurements settled it. First, a probe printing
+each decoded frame's best-matching source frame: every frame including B4 matches **its own** source
+(B4 = frame 4 at 35.56 dB, no cross-match), so it is right content at low quality, not a
+frame/reference mixup. Then the decisive one — **turn the pyramid off and code plain P-frames**
+(`ki=9`, no `GNC_B_PYRAMID`, 1I+8P):
+
+| frame | q=90 P-only |
+|---|---|
+| 4 [P] | **35.56 dB** |
+| 8 [P] | **32.61 dB** |
+
+Those are the *exact* numbers B4 and P8 carry inside the pyramid. **B4 is coded through `encode_pframe`
+(`sequence.rs:963`) — it *is* a forward P-frame** — and a plain forward P-frame at 4-frame distance is
+already 35.56 dB. The pyramid pulse is nothing but ordinary forward-P quality (B4, P8) sitting among
+the bidirectional leaf B-frames, which predict from two near neighbours and reach ~59 dB. No B4 defect,
+no reconstruction bug, no serialisation.
+
+**And that forward-P quality is pinned against quantisation, which is the real open item.** On this clip
+frame 4 [P] holds 35.56 dB across q=90/91/92/93/94 (bytes 371K→401K) and across `GNC_P_QP_SCALE` =
+default/1.0/0.5 — coarser *or* finer, the number does not move. So it is **not TUNE-5** (the known
+P_QP_SCALE saturation, `BUG-10`): forcing the scale to 1.0 at q=90, where TUNE-6's taper should already
+put it, changes nothing, and neither does 0.5. Above ~q=94 the encoder abandons inter and codes all-I
+(lossless), so there is no inter operating point where the P residual closes on the source.
+
+**What is and isn't claimed.** Claimed, and measured: the B-frame pulse is forward-P behaviour, not a
+B-frame bug, and it reproduces with no B-frames at all; and it is not TUNE-5. **Not claimed:** that this
+is a general P-frame defect. It is one synthetic clip (testsrc2, 4:2:0), and the P chain also *descends*
+(41→32 dB over 8 frames) which is ordinary error accumulation. Whether the qstep-immunity is a real
+residual-coding cap or a property of this content needs a second, real sequence — the protocol's ≥3
+sequences, which this box does not have to hand. The reproduction is a plain P-only encode watching one
+frame across q and `GNC_P_QP_SCALE`; no B-frames, no diagnostic build.
+
+The `GNC_B4_QSTEP_MUL` and `GNC_B4_PROBE` scaffolding is reverted — B4-specific knobs would mislead now
+that the effect is not B4-specific. **BUG-5's pulse is re-attributed to the forward-P path**; its own
+"stop paying on camera content" half is unaffected and stays as measured. The honest close: I chased a
+B4 reconstruction bug through five candidates and it was a P-frame all along — visible only because the
+pyramid stands a saturated forward frame next to unsaturated bidirectional ones.
+
+### Closed on real content: the pulse and the qstep-immunity are both testsrc2 artifacts
+
+The open item above — is forward-P qstep-immunity general or content-specific — is now answered on real
+sequences (`test_material/frames/sequences/{bbb,blue_sky}`, real motion, 4:2:0), and it is
+content-specific. Plain P-only, frame 4 [P] vs q:
+
+| sequence | q=90 | q=92 | q=94 |
+|---|---|---|---|
+| testsrc2 (synthetic) | 35.56 | 35.55 | 35.56 (**pinned**) |
+| bbb (animation) | 49.56 | 50.09 | **51.37** |
+| blue_sky (nature) | 49.59 | 50.13 | **51.43** |
+
+On real content forward-P frames respond to quantisation normally (+1.8 dB over four q-steps, bytes
+rising). The pin is testsrc2 only. And the B-pyramid pulse follows: with `GNC_B_PYRAMID=1` on the same
+real clips, every frame sits at ~49.5 dB and the codec's temporal-consistency metric reads **max drop
+0.13 dB (bbb) and 0.03 dB (blue_sky)** — against **26.23 dB** on testsrc2. **No frame-4 valley on real
+content.**
+
+**So the whole pulse was a synthetic-clip artifact.** testsrc2's moving high-frequency pattern produces
+a forward-prediction residual that does not close under finer quantisation; a hierarchical pyramid then
+stands that one saturated forward frame (B4/P8) next to the unsaturated bidirectional leaves and prints
+a 26 dB pulse. Real animation and real camera content show neither the pin nor the pulse. This is
+exactly what the protocol's "≥3 sequences before concluding" exists to catch — one synthetic clip
+manufactured a 26 dB defect that does not exist on anything real.
+
+**Consequences.** BUG-5's *reopened* root-cause thread is closed: the temporal pulse it chased is not a
+real defect. BUG-5's *original* finding — B-frames cost rate on camera content, pyramid off by default —
+was measured on real sequences and is untouched. And a standing note for the harness: **testsrc2 is fine
+for throughput (MEAS-5 density) but must not be used for inter *quality* or temporal-consistency
+measurements** — it saturates the forward-prediction path in a way no real content does. The user's
+"B-frames look broken" was a true reading of a synthetic clip that does not generalise.

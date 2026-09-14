@@ -83,7 +83,10 @@ fn the_floor_is_confined_to_the_measured_range() {
 #[test]
 fn lossless_intent_clears_both_dead_zones() {
     let cfg = quality_preset(100);
-    assert_eq!(cfg.dead_zone, 0.0, "q=100 carries an intra dead zone (BUG-30)");
+    assert_eq!(
+        cfg.dead_zone, 0.0,
+        "q=100 carries an intra dead zone (BUG-30)"
+    );
     assert_eq!(
         cfg.dead_zone_referenced, 0.0,
         "q=100 carries a referenced dead zone — the new field reopened BUG-30 through the back door"

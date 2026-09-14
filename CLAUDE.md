@@ -62,11 +62,18 @@ Shader source is in `src/shaders/*.wgsl`. Rust host code is in `src/encoder/` an
 
 ## Platform Notes
 
-- Dev machine: **Apple M5 Pro** — 20 GPU cores, 18 CPU cores, 64 GB, Metal 4. This line said
-  "Apple M1 — 8 GPU cores, ~2.6 TFLOPS FP32" until 2026-09-07 and **the changeover date is not
-  recorded anywhere**, so every throughput figure in this repository labelled M1 is of unknown
-  provenance (BUG-29). Run `gnc gpu-info` rather than trusting this line: it now prints the device
-  and its limits, which is what would have contradicted the wrong text months ago.
+- **Dev machines: there are TWO Macs, and a throughput row must say which one** (confirmed by the
+  owner 2026-09-14):
+  - **Apple M5 Pro** — 20 GPU cores, 18 CPU cores, 64 GB, Metal 4
+  - **Apple M1 Pro** — 16 cores, 16 GB — PERF-4/`0085`'s density ceiling was taken here
+
+  Their GPU core counts differ by 25% and their memory by 4x, so **"on the Mac" is not a label**
+  and two Mac rows are not comparable unless both name their machine. This line said "Apple M1 —
+  8 GPU cores, ~2.6 TFLOPS FP32" until 2026-09-07 with **no changeover date recorded anywhere**,
+  so every throughput figure labelled M1 before then is of unknown provenance (BUG-29) — and the
+  two-machine fact is why that was never resolvable by reading the tree. **Run `gnc gpu-info` and
+  quote what it prints**, rather than trusting this list; it prints the device and its limits,
+  which is what would have contradicted the wrong text months ago.
 - **GNC asks for wgpu's default limits, not the hardware's — with one named override**, so
   *almost* the same shaders run under WebGPU (rule 4). The gap to the adapter is large and
   deliberate — from `gnc gpu-info` on this machine:
@@ -141,9 +148,19 @@ The team's core principle: **correctness over speed, measurement over assumption
 | q > 85 (contribution, near lossless) | **PSNR** | VMAF is saturated and reads noise. Measured 2026-09-06: on old_town it returns 99.62–99.68 across a 6 dB PSNR spread, and widening a BD-rate ladder moved the VMAF figure by **47.5 points on average, 110 at worst**, while the PSNR figure moved **1.0**. A VMAF BD-rate at this end is not a weak number, it is not a number. |
 | anything touching chroma | **CIEDE2000** (`scripts/chroma_metric.py`) | VMAF cannot see colour at all. See below. |
 
-Since GNC is a *contribution* codec (GOALS §1), the second row is the project's home range —
-which means **PSNR leads more often than the old "VMAF is primary" rule implied.** That rule was
-written for the lossy range and was wrong above it.
+**Which row applies is a property of the measurement, not of the project.** PSNR leads more often
+than the old "VMAF is primary" rule implied, because that rule was written for the lossy range and
+is wrong above q=85. That is all the table says.
+
+**It does not say q>85 is where GNC lives, and an earlier version of this line did — citing GOALS
+§1 for the opposite of what GOALS §1 decides.** GOALS opens with *"GNC is broad on purpose — that
+is the decision, not an unresolved question"*, re-affirmed 2026-09-07 **after the repository had
+already drifted into narrowing it once**, and says all the segments are in scope at once with none
+of them primary (`docs/decisions/0055`). The range runs from heavy compression to bit-exact
+lossless, and a result at q=25 is not out of scope for being at q=25.
+
+The drift is easy to repeat because the narrow reading is convenient: it lets you dismiss a win by
+saying it landed in the wrong part of the range. Price a result on its numbers, not on its q.
 
 **VMAF scores the luma plane only.** It cannot see chroma being degraded, so it cannot validate
 any decision about a chroma parameter — chroma weighting, CfL range, chroma format trade-offs.
@@ -293,5 +310,7 @@ At every natural checkpoint (feature complete, priority item done):
 - **[BASELINE.md](BASELINE.md)** — Benchmark regression baseline
 - **[docs/BITSTREAM_SPEC.md](docs/BITSTREAM_SPEC.md)** — Bitstream format specification
 - **[RESEARCH_LOG.md](RESEARCH_LOG.md)** — Experiment log
+- **[docs/QUIET_HOUR.md](docs/QUIET_HOUR.md)** — The run list for the five items parked on an idle
+  GPU, in the order to collect them. Read it *before* stopping the other sessions, not after
 - **[README.md](README.md)** — Public project description
 - **[docs/archive/](docs/archive/)** — Historical documents (MILESTONES.md, INSTRUCTION.md, etc.)

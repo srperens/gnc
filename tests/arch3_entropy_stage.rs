@@ -41,7 +41,11 @@ fn panning_sequence_inner(w: u32, h: u32, n: usize, static_right: bool) -> Vec<V
             rng ^= rng >> 17;
             rng ^= rng << 5;
             let noise = (rng % 24) as f32 - 12.0;
-            let fine = if ((x / 2) + (y / 3)) % 2 == 0 { 18.0 } else { 0.0 };
+            let fine = if ((x / 2) + (y / 3)) % 2 == 0 {
+                18.0
+            } else {
+                0.0
+            };
             let coarse = ((x / 40) * 37 % 200) as f32;
             let ramp = y as f32 / hu as f32 * 120.0;
             let px = (y * wu + x) * 3;
@@ -55,7 +59,11 @@ fn panning_sequence_inner(w: u32, h: u32, n: usize, static_right: bool) -> Vec<V
             let mut f = vec![0.0f32; base.len()];
             for y in 0..hu {
                 for x in 0..wu {
-                    let dx = if static_right && x >= wu / 2 { 0 } else { i * 3 };
+                    let dx = if static_right && x >= wu / 2 {
+                        0
+                    } else {
+                        i * 3
+                    };
                     let sx = (x + dx) % wu;
                     for c in 0..3 {
                         f[(y * wu + x) * 3 + c] = base[(y * wu + sx) * 3 + c];

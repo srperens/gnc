@@ -308,6 +308,9 @@ fn serialize_frame_header(frame: &crate::CompressedFrame, out: &mut Vec<u8>) {
     out.push(u8::from(frame.config.per_subband_entropy));
     // Chroma format byte (GP13 — always written here to maintain correct byte alignment)
     out.push(frame.info.chroma_format.to_u8());
+    // Colour space byte (GP21, LOSSLESS-4). Same rule: always written, gated on read. Says
+    // whether the three planes are YCoCg-R from RGB or the source's own Y'CbCr coded verbatim.
+    out.push(frame.config.color_space.to_byte());
     // Subband weights: ll, num_detail_levels, per-level [LH, HL, HH], chroma_weight
     let sw = &frame.config.subband_weights;
     out.extend_from_slice(&sw.ll.to_le_bytes());
@@ -349,7 +352,7 @@ fn serialize_frame_header(frame: &crate::CompressedFrame, out: &mut Vec<u8>) {
     if let Some(ref modes) = frame.intra_modes {
         out.push(1u8); // intra_flag
         let num_blocks = modes.len() as u32 * 4; // approximate: 4 modes per byte
-        // Store exact block count from dimensions
+                                                 // Store exact block count from dimensions
         let blocks_x = frame.info.padded_width() / 8;
         let blocks_y = frame.info.padded_height() / 8;
         let exact_blocks = blocks_x * blocks_y;
@@ -378,12 +381,11 @@ fn serialize_tile_blobs(entropy: &crate::EntropyData) -> Vec<Vec<u8>> {
         crate::EntropyData::SubbandRans(tiles) => {
             tiles.iter().map(rans::serialize_tile_subband).collect()
         }
-        crate::EntropyData::Bitplane(tiles) => {
-            tiles.iter().map(bitplane::serialize_tile_bitplane).collect()
-        }
-        crate::EntropyData::Rice(tiles) => {
-            tiles.iter().map(rice::serialize_tile_rice).collect()
-        }
+        crate::EntropyData::Bitplane(tiles) => tiles
+            .iter()
+            .map(bitplane::serialize_tile_bitplane)
+            .collect(),
+        crate::EntropyData::Rice(tiles) => tiles.iter().map(rice::serialize_tile_rice).collect(),
         crate::EntropyData::Huffman(tiles) => {
             tiles.iter().map(huffman::serialize_tile_huffman).collect()
         }
@@ -420,7 +422,11 @@ fn median3(a: i16, b: i16, c: i16) -> i16 {
 fn mv_predictor(vectors: &[[i16; 2]], bx: usize, by: usize, blocks_x: usize) -> [i16; 2] {
     let idx = by * blocks_x + bx;
     let left = if bx > 0 { vectors[idx - 1] } else { [0, 0] };
-    let above = if by > 0 { vectors[idx - blocks_x] } else { [0, 0] };
+    let above = if by > 0 {
+        vectors[idx - blocks_x]
+    } else {
+        [0, 0]
+    };
     let above_right = if by > 0 && bx + 1 < blocks_x {
         vectors[idx - blocks_x + 1]
     } else {
@@ -503,7 +509,11 @@ pub(crate) struct BitReader<'a> {
 
 impl<'a> BitReader<'a> {
     pub(crate) fn new(data: &'a [u8], start: usize) -> Self {
-        Self { data, byte: start, bit: 0 }
+        Self {
+            data,
+            byte: start,
+            bit: 0,
+        }
     }
 
     pub(crate) fn get_bit(&mut self) -> u32 {
@@ -680,10 +690,19 @@ pub fn serialize_compressed(frame: &crate::CompressedFrame) -> Vec<u8> {
     // GP15 splits Rice k_zrl into k_zrl_nz + k_zrl_z per subband (K_STRIDE 17→25 per tile, #53).
     // GP14 adds fwd_ref_idx + bwd_ref_idx for hierarchical pyramid B-frames.
     // GP13 is GP12 + chroma_format byte.
-    // GP20 adds TILE-1's padding grid on top of GP19 — see the generation table in
-    // `deserialize_compressed`. It is a superset: a GP20 frame also carries GP19's abac
-    // binarisation, which is why the number goes up rather than branching.
-    out.extend_from_slice(b"GP20");
+    //
+    // GP21 added the colour-space byte: the planes may be the source's own Y'CbCr, coded with
+    // no colour transform at either end (LOSSLESS-4).
+    //
+    // GP22 adds TILE-1's padding grid on top of GP21 — the plane is padded to `PLANE_PAD_ALIGN`
+    // rather than up to a whole `tile_size`. It is a superset: a GP22 frame also carries GP19's
+    // abac binarisation and GP21's colour-space byte, which is why the number goes up rather
+    // than branching. **GP20 is skipped and stays unreadable** — it was written only on the
+    // unmerged `tile1` branch, for this same padding grid but *without* GP21's colour-space
+    // byte, so it names a format that no longer exists. Refusing it is the `0074` rule: a
+    // generation decides how a file is read, and misreading one grid as the other yields a
+    // plausible wrong image rather than an error.
+    out.extend_from_slice(CURRENT_MAGIC);
     // Common header fields (includes chroma_format byte for GP13)
     serialize_frame_header(frame, &mut out);
     // Motion field — GP12 uses delta-coded varint MVs
@@ -761,6 +780,11 @@ impl TileCrcResult {
 }
 
 /// Result of deserializing a GP11 frame with CRC validation.
+/// The magic `serialize_compressed` stamps. Single source of truth: `tests/bitstream_generation.rs`
+/// asserts it is the newest entry in the table below, and tests assert against this rather than a
+/// literal so that a bump touches one place instead of five.
+pub const CURRENT_MAGIC: &[u8; 4] = b"GP22";
+
 #[derive(Debug, Clone)]
 pub struct DeserializeResult {
     pub frame: crate::CompressedFrame,
@@ -809,11 +833,8 @@ pub fn substitute_tiles(frame: &mut crate::CompressedFrame, tile_indices: &[usiz
             crate::EntropyData::SubbandRans(ref mut tiles) => {
                 if idx < tiles.len() {
                     let t = &tiles[idx];
-                    tiles[idx] = make_zero_subband_tile(
-                        t.num_coefficients,
-                        t.tile_size,
-                        t.num_levels,
-                    );
+                    tiles[idx] =
+                        make_zero_subband_tile(t.num_coefficients, t.tile_size, t.num_levels);
                 }
             }
             crate::EntropyData::Bitplane(ref mut tiles) => {
@@ -868,7 +889,10 @@ pub fn substitute_tiles(frame: &mut crate::CompressedFrame, tile_indices: &[usiz
                         tile_size: t.tile_size,
                         num_levels: t.num_levels,
                         num_groups: t.num_groups,
-                        code_lengths: vec![vec![0u8; huffman::HUFFMAN_ALPHABET_SIZE]; t.num_groups as usize],
+                        code_lengths: vec![
+                            vec![0u8; huffman::HUFFMAN_ALPHABET_SIZE];
+                            t.num_groups as usize
+                        ],
                         k_zrl_values: vec![0; t.num_groups as usize],
                         stream_lengths: vec![0; huffman::HUFFMAN_STREAMS_PER_TILE],
                         stream_data: Vec::new(),
@@ -974,18 +998,20 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
         // GP19: abac context-codes the Exp-Golomb unary prefix (ENT-9 candidate A). Only type 5
         // moved; every other coder is byte-identical to GP18.
         b"GP19" => 19,
-        // GP20: TILE-1 stage 1 — the plane is padded to `PLANE_PAD_ALIGN` (32, i.e. `2^levels`)
+        b"GP21" => 21,
+        // GP22: TILE-1 stage 1 — the plane is padded to `PLANE_PAD_ALIGN` (32, i.e. `2^levels`)
         // instead of up to a whole `tile_size`, so the last tile row and column are short.
         //
-        // **This was written as GP19 and had to be renumbered (BUG-51).** ENT-9 took GP19 on
-        // `main` for a different format while this change was uncommitted in an orphaned
-        // worktree, and the two collided under one number — which is worse than the decision-record
-        // and item-id collisions that preceded it, because a generation decides how a *file* is
-        // read: `gen >= 19` gates would have been true for both formats and misreading one as the
-        // other yields a plausible wrong image rather than an error, exactly as `0074` warns.
-        b"GP20" => 20,
+        // **This was written as GP19, renumbered to GP20, and is GP22 here (BUG-51).** ENT-9 took
+        // GP19 on `main` for a different format while this change was uncommitted in an orphaned
+        // worktree; LOSSLESS-4 then took GP21 while it sat unmerged on a branch. GP20 is not
+        // listed and therefore panics: the merged encoder writes *both* the colour-space byte and
+        // this grid, so no file it produces is a GP20 file, and a real GP20 file from the branch
+        // carries this grid without that byte. Reading either as the other is the failure `0074`
+        // describes — a plausible wrong image rather than an error.
+        b"GP22" => 22,
         _ => panic!(
-            "Invalid magic (expected GPC8..GP20; older files must be re-encoded)"
+            "Invalid magic (expected GPC8..GP22, excluding GP20; older files must be re-encoded)"
         ),
     };
 
@@ -1020,12 +1046,26 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
 
     // Chroma format byte (GP13/GP14; older formats default to 4:4:4)
     let chroma_format_decoded = if gen >= 13 {
-        let cf = crate::ChromaFormat::from_u8(data[pos])
-            .unwrap_or(crate::ChromaFormat::Yuv444);
+        let cf = crate::ChromaFormat::from_u8(data[pos]).unwrap_or(crate::ChromaFormat::Yuv444);
         pos += 1;
         cf
     } else {
         crate::ChromaFormat::Yuv444
+    };
+
+    // Colour space byte (GP21; every older generation converted from RGB, so YCoCg-R is not a
+    // guess for them — it is the only thing they could have been). An unknown value is refused
+    // rather than defaulted: the planes would decode to a plausible wrong picture, which is the
+    // failure mode `0074` spells out.
+    let color_space_decoded = if gen >= 21 {
+        let byte = data[pos];
+        let cs = crate::ColorSpace::from_byte(byte).unwrap_or_else(|| {
+            panic!("Unknown colour space byte {byte} at offset {pos} in a GP{gen} frame")
+        });
+        pos += 1;
+        cs
+    } else {
+        crate::ColorSpace::YCoCgR
     };
 
     // --- Subband weights ---
@@ -1124,8 +1164,7 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
         let mf = if ft == crate::FrameType::Predicted || ft == crate::FrameType::Bidirectional {
             let block_size = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as u32;
             pos += 2;
-            let num_blocks =
-                u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+            let num_blocks = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
             pos += 4;
             let vectors = if gen >= 12 {
                 // GP12/GP13/GP14: delta-coded zigzag varint MVs
@@ -1144,54 +1183,57 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
                 vecs
             };
             // GP11/GP12/GP13/GP14 B-frames: backward vectors + block modes
-            let (backward_vectors, block_modes, fwd_ref_idx, bwd_ref_idx) =
-                if (gen >= 11) && ft == crate::FrameType::Bidirectional {
-                    let bwd_count =
-                        u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-                    pos += 4;
-                    let bwd = if bwd_count > 0 {
-                        if gen >= 12 {
-                            let padded_w = width.div_ceil(tile_size) * tile_size;
-                            let bwd_blocks_x = (padded_w / 16) as usize;
-                            Some(deserialize_mvs_delta(data, &mut pos, bwd_count, bwd_blocks_x))
-                        } else {
-                            let mut bv = Vec::with_capacity(bwd_count);
-                            for _ in 0..bwd_count {
-                                let dx =
-                                    i16::from_le_bytes(data[pos..pos + 2].try_into().unwrap());
-                                let dy =
-                                    i16::from_le_bytes(data[pos + 2..pos + 4].try_into().unwrap());
-                                bv.push([dx, dy]);
-                                pos += 4;
-                            }
-                            Some(bv)
+            let (backward_vectors, block_modes, fwd_ref_idx, bwd_ref_idx) = if (gen >= 11)
+                && ft == crate::FrameType::Bidirectional
+            {
+                let bwd_count = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+                pos += 4;
+                let bwd = if bwd_count > 0 {
+                    if gen >= 12 {
+                        let padded_w = width.div_ceil(tile_size) * tile_size;
+                        let bwd_blocks_x = (padded_w / 16) as usize;
+                        Some(deserialize_mvs_delta(
+                            data,
+                            &mut pos,
+                            bwd_count,
+                            bwd_blocks_x,
+                        ))
+                    } else {
+                        let mut bv = Vec::with_capacity(bwd_count);
+                        for _ in 0..bwd_count {
+                            let dx = i16::from_le_bytes(data[pos..pos + 2].try_into().unwrap());
+                            let dy = i16::from_le_bytes(data[pos + 2..pos + 4].try_into().unwrap());
+                            bv.push([dx, dy]);
+                            pos += 4;
                         }
-                    } else {
-                        None
-                    };
-                    let modes_count =
-                        u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-                    pos += 4;
-                    let modes = if modes_count > 0 {
-                        let m = data[pos..pos + modes_count].to_vec();
-                        pos += modes_count;
-                        Some(m)
-                    } else {
-                        None
-                    };
-                    // GP14+: ref pool indices (1 byte each); older formats default to 0/1
-                    let (fwd_idx, bwd_idx) = if gen >= 14 {
-                        let f = data[pos];
-                        let b = data[pos + 1];
-                        pos += 2;
-                        (Some(f), Some(b))
-                    } else {
-                        (None, None)
-                    };
-                    (bwd, modes, fwd_idx, bwd_idx)
+                        Some(bv)
+                    }
                 } else {
-                    (None, None, None, None)
+                    None
                 };
+                let modes_count =
+                    u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+                pos += 4;
+                let modes = if modes_count > 0 {
+                    let m = data[pos..pos + modes_count].to_vec();
+                    pos += modes_count;
+                    Some(m)
+                } else {
+                    None
+                };
+                // GP14+: ref pool indices (1 byte each); older formats default to 0/1
+                let (fwd_idx, bwd_idx) = if gen >= 14 {
+                    let f = data[pos];
+                    let b = data[pos + 1];
+                    pos += 2;
+                    (Some(f), Some(b))
+                } else {
+                    (None, None)
+                };
+                (bwd, modes, fwd_idx, bwd_idx)
+            } else {
+                (None, None, None, None)
+            };
             Some(crate::MotionField {
                 vectors,
                 block_size,
@@ -1264,7 +1306,11 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
                 tiles.push(tile);
                 pos += consumed;
             }
-            (crate::EntropyCoder::Rans, crate::EntropyData::Rans(tiles), false)
+            (
+                crate::EntropyCoder::Rans,
+                crate::EntropyData::Rans(tiles),
+                false,
+            )
         }
         1 => {
             let mut tiles = Vec::with_capacity(num_tiles);
@@ -1354,8 +1400,7 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
                 } else {
                     &data[pos..]
                 };
-                let (tile, consumed) =
-                    crate::encoder::abac_tile::deserialize_tile_abac(slice);
+                let (tile, consumed) = crate::encoder::abac_tile::deserialize_tile_abac(slice);
                 tiles.push(tile);
                 pos += consumed;
             }
@@ -1376,15 +1421,20 @@ pub fn deserialize_compressed_validated(data: &[u8]) -> DeserializeResult {
                 bit_depth,
                 tile_size,
                 chroma_format: chroma_format_decoded,
-                // BUG-51: gated on 20, not 19. A GP19 file is ENT-9's abac change and still
-                // uses the tile-size grid; only GP20 padded to `PLANE_PAD_ALIGN`.
-                plane_pad_align: if gen >= 20 {
+                // BUG-51: gated on 22, not 19 and not 20. GP19 is ENT-9's abac change and
+                // GP21 is LOSSLESS-4's colour-space byte; both still use the tile-size grid.
+                // Only GP22 pads to `PLANE_PAD_ALIGN`. Every time this change was rebased the
+                // gate had to move with the magic, and leaving it behind is precisely the
+                // "plausible wrong image" failure — a GP21 file read on the 32-sample grid gets
+                // the right byte count and the wrong geometry.
+                plane_pad_align: if gen >= 22 {
                     crate::PLANE_PAD_ALIGN
                 } else {
                     tile_size
                 },
             },
             config: crate::CodecConfig {
+                color_space: color_space_decoded,
                 tile_size,
                 quantization_step: qstep,
                 dead_zone,
@@ -1855,8 +1905,11 @@ pub fn deserialize_temporal_group(
     // Collect highpass entries (frame_role=1), grouped by temporal_level
     // Entries are stored deepest-first in the file, but high_frames vec
     // is indexed [0] = finest level, so we need to reconstruct that ordering.
-    let hp_entries: Vec<&TemporalFrameIndexEntry> =
-        gop_entries.iter().filter(|e| e.frame_role == 1).copied().collect();
+    let hp_entries: Vec<&TemporalFrameIndexEntry> = gop_entries
+        .iter()
+        .filter(|e| e.frame_role == 1)
+        .copied()
+        .collect();
 
     if hp_entries.is_empty() {
         return crate::TemporalGroup {
@@ -2034,7 +2087,7 @@ mod tests {
             k_values: vec![0; num_groups as usize],
             k_zrl_nz_values: vec![0; num_groups as usize],
             k_zrl_z_values: vec![0; num_groups as usize],
-            skip_bitmap: 0xFF, // all groups skipped (all zeros)
+            skip_bitmap: 0xFF,        // all groups skipped (all zeros)
             k_stream_odd: Vec::new(), // no checkerboard ctx for all-skip tile
             stream_lengths: vec![0; rice::RICE_STREAMS_PER_TILE],
             stream_data: Vec::new(),
@@ -2087,7 +2140,10 @@ mod tests {
             low_frame: make_test_frame(width, height),
             high_frames: vec![
                 // level 0 (finest): 2 frames
-                vec![make_test_frame(width, height), make_test_frame(width, height)],
+                vec![
+                    make_test_frame(width, height),
+                    make_test_frame(width, height),
+                ],
                 // level 1 (deepest): 1 frame
                 vec![make_test_frame(width, height)],
             ],
@@ -2178,8 +2234,7 @@ mod tests {
             for (li, level_frames) in group.high_frames.iter().enumerate() {
                 for (fi, frame) in level_frames.iter().enumerate() {
                     let hp_bytes = serialize_compressed(frame);
-                    let orig_hp_bytes =
-                        serialize_compressed(&orig_group.high_frames[li][fi]);
+                    let orig_hp_bytes = serialize_compressed(&orig_group.high_frames[li][fi]);
                     assert_eq!(
                         hp_bytes, orig_hp_bytes,
                         "Highpass frame mismatch in GOP {gi}, level {li}, frame {fi}"

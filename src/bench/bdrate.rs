@@ -24,8 +24,16 @@ pub fn bd_rate(reference: &[RdPoint], test: &[RdPoint]) -> Option<f64> {
 
     let mut ref_sorted: Vec<RdPoint> = reference.to_vec();
     let mut test_sorted: Vec<RdPoint> = test.to_vec();
-    ref_sorted.sort_by(|a, b| a.psnr.partial_cmp(&b.psnr).unwrap_or(std::cmp::Ordering::Equal));
-    test_sorted.sort_by(|a, b| a.psnr.partial_cmp(&b.psnr).unwrap_or(std::cmp::Ordering::Equal));
+    ref_sorted.sort_by(|a, b| {
+        a.psnr
+            .partial_cmp(&b.psnr)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    test_sorted.sort_by(|a, b| {
+        a.psnr
+            .partial_cmp(&b.psnr)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // Use log(bpp) for integration (standard BD-rate practice)
     // Filter out inf/NaN PSNR (lossless points) and zero/negative bpp
@@ -78,8 +86,16 @@ pub fn bd_psnr(reference: &[RdPoint], test: &[RdPoint]) -> Option<f64> {
 
     let mut ref_sorted: Vec<RdPoint> = reference.to_vec();
     let mut test_sorted: Vec<RdPoint> = test.to_vec();
-    ref_sorted.sort_by(|a, b| a.bpp.partial_cmp(&b.bpp).unwrap_or(std::cmp::Ordering::Equal));
-    test_sorted.sort_by(|a, b| a.bpp.partial_cmp(&b.bpp).unwrap_or(std::cmp::Ordering::Equal));
+    ref_sorted.sort_by(|a, b| {
+        a.bpp
+            .partial_cmp(&b.bpp)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    test_sorted.sort_by(|a, b| {
+        a.bpp
+            .partial_cmp(&b.bpp)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // Use log(bpp) as x-axis — filter out inf/NaN PSNR and zero/negative bpp
     let ref_pts: Vec<(f64, f64)> = ref_sorted
@@ -282,7 +298,11 @@ pub fn load_rd_curve(path: &str) -> Result<Vec<RdPoint>, Box<dyn std::error::Err
         points.push(RdPoint { bpp, psnr });
     }
 
-    points.sort_by(|a, b| a.psnr.partial_cmp(&b.psnr).unwrap_or(std::cmp::Ordering::Equal));
+    points.sort_by(|a, b| {
+        a.psnr
+            .partial_cmp(&b.psnr)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     Ok(points)
 }
 

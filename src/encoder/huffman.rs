@@ -634,10 +634,7 @@ pub fn huffman_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32
     }
 
     // Extract code lengths for serialization
-    let code_lengths: Vec<Vec<u8>> = codebooks
-        .iter()
-        .map(|cb| cb.code_lengths.clone())
-        .collect();
+    let code_lengths: Vec<Vec<u8>> = codebooks.iter().map(|cb| cb.code_lengths.clone()).collect();
 
     HuffmanTile {
         num_coefficients: num_coefficients as u32,
@@ -679,12 +676,8 @@ pub fn huffman_decode_tile(tile: &HuffmanTile) -> Vec<i32> {
             let token = reader.read_bit();
             if token == 0 {
                 // Zero run
-                let first_idx = stream_coeff_index(
-                    stream_id,
-                    s,
-                    symbols_per_stream,
-                    tile.tile_size as usize,
-                );
+                let first_idx =
+                    stream_coeff_index(stream_id, s, symbols_per_stream, tile.tile_size as usize);
                 let zy = (first_idx / tile.tile_size as usize) as u32;
                 let zx = (first_idx % tile.tile_size as usize) as u32;
                 let g_zrl = compute_subband_group(zx, zy, tile.tile_size, tile.num_levels);
@@ -693,12 +686,8 @@ pub fn huffman_decode_tile(tile: &HuffmanTile) -> Vec<i32> {
                 s += run as usize;
             } else {
                 // Non-zero coefficient
-                let coeff_idx = stream_coeff_index(
-                    stream_id,
-                    s,
-                    symbols_per_stream,
-                    tile.tile_size as usize,
-                );
+                let coeff_idx =
+                    stream_coeff_index(stream_id, s, symbols_per_stream, tile.tile_size as usize);
                 let sign = reader.read_bit();
 
                 let y = (coeff_idx / tile.tile_size as usize) as u32;
@@ -914,8 +903,18 @@ mod tests {
             }
             let padded = (code << (8 - len)) as usize;
             let entry = table[padded];
-            assert_eq!((entry >> 16) as usize, sym, "Symbol mismatch for sym={}", sym);
-            assert_eq!((entry & 0xFFFF) as u8, len, "Length mismatch for sym={}", sym);
+            assert_eq!(
+                (entry >> 16) as usize,
+                sym,
+                "Symbol mismatch for sym={}",
+                sym
+            );
+            assert_eq!(
+                (entry & 0xFFFF) as u8,
+                len,
+                "Length mismatch for sym={}",
+                sym
+            );
         }
     }
 
@@ -945,7 +944,11 @@ mod tests {
         // Mix of magnitudes
         for (i, c) in coefficients.iter_mut().enumerate() {
             let v = (i % 256) as i32;
-            *c = if v < 128 { 0 } else { (v - 128) * if i % 3 == 0 { -1 } else { 1 } };
+            *c = if v < 128 {
+                0
+            } else {
+                (v - 128) * if i % 3 == 0 { -1 } else { 1 }
+            };
         }
         let tile = huffman_encode_tile(&coefficients, 128, 3);
         let decoded = huffman_decode_tile(&tile);
@@ -1034,7 +1037,10 @@ mod tests {
                     seen[idx] = true;
                 }
             }
-            assert!(seen.iter().all(|&b| b), "tile {tile_size}: coefficients left unvisited");
+            assert!(
+                seen.iter().all(|&b| b),
+                "tile {tile_size}: coefficients left unvisited"
+            );
         }
     }
 
@@ -1111,7 +1117,10 @@ mod tests {
             }
             let tile = huffman_encode_tile(&coefficients, tile_size, 3);
             let decoded = huffman_decode_tile(&tile);
-            assert_eq!(coefficients, decoded, "roundtrip failed at tile {tile_size}");
+            assert_eq!(
+                coefficients, decoded,
+                "roundtrip failed at tile {tile_size}"
+            );
         }
     }
 }

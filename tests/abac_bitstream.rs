@@ -1,4 +1,4 @@
-//! `EntropyCoder::Abac` end to end: encode → GP20 bitstream → GPU decode.
+//! `EntropyCoder::Abac` end to end: encode → bitstream → GPU decode.
 //!
 //! The property that makes these tests strong is that entropy coding is **lossless**. Rice and
 //! abac code the identical quantised coefficients, so a frame encoded either way must decode to
@@ -10,8 +10,8 @@
 //! Synthesises its own images so these run without test material.
 
 use gnc::decoder::pipeline::DecoderPipeline;
-use gnc::encoder::pipeline::EncoderPipeline;
 use gnc::encoder::abac::Coder;
+use gnc::encoder::pipeline::EncoderPipeline;
 use gnc::{ChromaFormat, EntropyCoder, EntropyData, GpuContext};
 use std::sync::OnceLock;
 
@@ -31,7 +31,11 @@ fn synth_image(w: u32, h: u32) -> Vec<f32> {
             rng ^= rng >> 17;
             rng ^= rng << 5;
             let noise = (rng % 24) as f32 - 12.0;
-            let fine = if ((x / 2) + (y / 3)) % 2 == 0 { 18.0 } else { 0.0 };
+            let fine = if ((x / 2) + (y / 3)) % 2 == 0 {
+                18.0
+            } else {
+                0.0
+            };
             let coarse = ((x / 40) * 37 % 200) as f32;
             let ramp = y as f32 / h as f32 * 120.0;
             let r = (coarse + ramp + fine + noise).clamp(0.0, 255.0).round();
@@ -60,7 +64,8 @@ fn roundtrip(
     let bytes = gnc::format::serialize_compressed(&compressed);
     let back = gnc::format::deserialize_compressed(&bytes);
     assert!(
-        matches!(back.entropy, EntropyData::Abac(_)) == matches!(compressed.entropy, EntropyData::Abac(_)),
+        matches!(back.entropy, EntropyData::Abac(_))
+            == matches!(compressed.entropy, EntropyData::Abac(_)),
         "the container changed which entropy coder the frame uses"
     );
     (decoder.decode(ctx, &back), bytes.len())
@@ -116,9 +121,14 @@ fn abac_frames_are_gp19_and_carry_entropy_type_5() {
     let mut encoder = EncoderPipeline::new(ctx);
     let compressed = encoder.encode(ctx, &img, w, h, &config);
     let bytes = gnc::format::serialize_compressed(&compressed);
-    // GP20 since TILE-1 renumbered its padding grid off ENT-9's GP19 (BUG-51). The writer
-    // always emits the newest generation, so this tracks it rather than pinning 19.
-    assert_eq!(&bytes[0..4], b"GP20", "abac frames must declare the current generation");
+    // Tracks `CURRENT_MAGIC` rather than pinning a literal: this assertion has had to be
+    // renumbered three times (GP19 → GP20 → GP22, BUG-51) and each renumber was a chance to
+    // move the label without moving the gate behind it.
+    assert_eq!(
+        &bytes[0..4],
+        gnc::format::CURRENT_MAGIC,
+        "abac frames must declare the current generation"
+    );
 
     let back = gnc::format::deserialize_compressed(&bytes);
     assert_eq!(back.config.entropy_coder, EntropyCoder::Abac);
@@ -129,7 +139,10 @@ fn abac_frames_are_gp19_and_carry_entropy_type_5() {
     assert_eq!(tiles.len(), 3, "256x256 at tile 256 is one tile per plane");
     for t in tiles {
         assert_eq!(t.tile_size, config.tile_size);
-        assert!(!t.block_lengths.is_empty(), "a tile with no blocks decodes to nothing");
+        assert!(
+            !t.block_lengths.is_empty(),
+            "a tile with no blocks decodes to nothing"
+        );
         assert_eq!(
             t.block_data.len(),
             t.block_lengths.iter().sum::<u32>() as usize,
@@ -172,7 +185,10 @@ fn abac_handles_subsampled_chroma() {
             .zip(px_abac.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
-        assert_eq!(worst, 0.0, "{fmt:?}: abac and Rice decoded different pixels");
+        assert_eq!(
+            worst, 0.0,
+            "{fmt:?}: abac and Rice decoded different pixels"
+        );
     }
 }
 
@@ -198,7 +214,10 @@ fn both_arithmetic_engines_roundtrip_through_the_container() {
     for engine in [Coder::Range, Coder::Interval] {
         config.abac_coder = engine;
         let (px, size) = roundtrip(ctx, &img, w, h, &config);
-        assert!(px.iter().all(|v| v.is_finite()), "{engine:?}: decoded NaN or inf");
+        assert!(
+            px.iter().all(|v| v.is_finite()),
+            "{engine:?}: decoded NaN or inf"
+        );
         sizes.push((engine, px, size));
     }
 
@@ -341,18 +360,22 @@ fn abac_survives_a_p_frame_chain() {
     );
 }
 
-/// GP19's only change is *how* entropy type 5 codes its Exp-Golomb prefix, so a GP19 frame using
-/// any other coder must be a GP18 frame with a different label. Asserting that directly is worth
-/// more than believing it: relabel the magic, decode, and require the identical picture. It also
-/// exercises the other half — that the decoder still reads GP18, which is what every file written
-/// before ENT-9 says.
+/// **A generation that adds a header field must not be readable as the one before it.**
 ///
-/// **This holds at 256x256 and would not at 1920x1080 (TILE-1 / GP20).** GP20 pads the plane to
-/// `PLANE_PAD_ALIGN` instead of a whole tile, which changes the coded grid for *every* coder — so
-/// the "a bump only relabels the payload" property is specific to ENT-9's GP19, and this test
-/// keeps it true by using a size where both grids coincide. Do not generalise the size.
+/// This test used to assert the opposite, and correctly so: GP19 changed only *how* entropy type 5
+/// binarised its Exp-Golomb prefix, added nothing to the header, and so a GP19 Rice frame relabelled
+/// GP18 decoded to the identical picture. GP21 (LOSSLESS-4) breaks that premise on purpose — it adds
+/// the colour-space byte — so the honest successor is the inverse claim.
+///
+/// Keeping the old assertion and bumping the literal would have passed only if the new byte were
+/// ungated, which is precisely the defect. BUG-51's warning is that a clean textual resolution hides
+/// a semantic clash; this is that warning arriving in a test rather than in a merge.
+///
+/// **Keep the size at 256x256, and do not generalise it.** GP22 (TILE-1) pads the plane to
+/// `PLANE_PAD_ALIGN` instead of to a whole tile, so at 1920x1080 the two grids disagree and this
+/// test would be measuring the grid rather than the header gate. 256x256 is a whole tile on both.
 #[test]
-fn gp19_rice_frames_are_gp18_payloads_with_a_new_label() {
+fn a_generation_that_adds_a_header_field_cannot_be_read_as_the_previous_one() {
     let ctx = gpu();
     let (w, h) = (256u32, 256u32);
     let img = synth_image(w, h);
@@ -362,20 +385,27 @@ fn gp19_rice_frames_are_gp18_payloads_with_a_new_label() {
     let mut encoder = EncoderPipeline::new(ctx);
     let compressed = encoder.encode(ctx, &img, w, h, &config);
     let mut bytes = gnc::format::serialize_compressed(&compressed);
-    assert_eq!(&bytes[0..4], b"GP20");
+    assert_eq!(&bytes[0..4], gnc::format::CURRENT_MAGIC);
 
     let decoder = DecoderPipeline::new(ctx);
-    let as_gp19 = decoder.decode(ctx, &gnc::format::deserialize_compressed(&bytes));
+    let correct = decoder.decode(ctx, &gnc::format::deserialize_compressed(&bytes));
 
+    // Relabel as GP18, which has no colour-space byte. Every field after it now reads one byte
+    // early. Either the parse gives up or it yields a different picture; what it must not do is
+    // agree, because agreeing would mean the byte is not actually gated on the generation.
     bytes[0..4].copy_from_slice(b"GP18");
-    let as_gp18 = decoder.decode(ctx, &gnc::format::deserialize_compressed(&bytes));
+    let misread = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        decoder.decode(ctx, &gnc::format::deserialize_compressed(&bytes))
+    }));
 
-    assert_eq!(
-        as_gp19, as_gp18,
-        "relabelling a Rice frame GP19 → GP18 changed the decode, so GP19 moved something other \
-         than the magic and abac's prefix binarisation — either the generation added a field it \
-         should not have, or the decoder gates a field on gen >= 19 that older files also carry"
-    );
+    if let Ok(picture) = misread {
+        assert_ne!(
+            correct, picture,
+            "a frame written at the current generation decoded identically when relabelled GP18, \
+             so the field that generation added is not gated on it — an older decoder would read \
+             a new file as a plausible wrong picture rather than refusing it"
+        );
+    }
 }
 
 // `inter_reconstruction_depends_on_the_encode_path` lived here and asserted that the two encode

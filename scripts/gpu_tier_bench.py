@@ -205,6 +205,62 @@ def density(binary: Path, clip: Path, frames: int, quality: int, ki: int,
     return rows
 
 
+def density_inproc(binary: Path, image: Path, iterations: int, quality: int,
+                   levels: list[int], adapter: str | None,
+                   per_stream_device: bool) -> list[dict]:
+    """PERF-4: the same sweep with the processes taken out.
+
+    `density_still` launches N copies of the binary, so each instance pays its own
+    device creation, its own pipeline build and its own first frame — and the wall
+    clock it divides by contains all three. That inflates the scaling column
+    (the N=1 row carries the fixed cost undivided) and deflates the absolute fps.
+
+    `gnc density` runs the N streams as threads in one process and times only the
+    steady-state window, behind a barrier, after every stream has warmed up. It is
+    the row to quote for "how many streams does this GPU carry"; `density_still`
+    is the row to quote for "what does an operator see if they run N processes".
+    """
+    rows = []
+    for n in levels:
+        cmd = [str(binary), "density", "-i", str(image), "-n", str(iterations),
+               "-q", str(quality), "--streams", str(n), "--json"]
+        if per_stream_device:
+            cmd.append("--per-stream-device")
+        merged = dict(os.environ)
+        if adapter:
+            merged["GNC_GPU_ADAPTER"] = adapter
+        stop = threading.Event()
+        power: list[float] = []
+        t = threading.Thread(target=sample_power, args=(stop, power), daemon=True)
+        t.start()
+        start = time.perf_counter()
+        proc = subprocess.run(cmd, env=merged, capture_output=True, text=True)
+        wall = time.perf_counter() - start
+        stop.set()
+        t.join(timeout=3)
+        if proc.returncode != 0:
+            rows.append({"instances": n, "completed": 0, "wall_s": wall,
+                         "aggregate_fps": 0.0, "power_w_mean": None, "power_w_max": None,
+                         "error": (proc.stderr.strip().splitlines() or [""])[-1]})
+            continue
+        # The JSON object is the last line; the encoder prints canary lines before it.
+        summary = json.loads(proc.stdout.strip().splitlines()[-1])
+        rows.append({
+            "instances": n,
+            "completed": n,
+            "wall_s": summary["steady_s"],
+            "aggregate_fps": summary["aggregate_fps"],
+            "per_stream_fps": summary["per_stream_fps"],
+            "setup_ms": summary["setup_ms_max"],
+            "megapixels_per_s": summary["aggregate_fps"] * summary["width"]
+            * summary["height"] / 1e6,
+            "power_w_mean": (sum(power) / len(power)) if power else None,
+            "power_w_max": max(power) if power else None,
+            "error": None,
+        })
+    return rows
+
+
 def sample_power(stop: threading.Event, out: list[float]) -> None:
     """Poll GPU power draw until told to stop. `nvidia-smi`'s utilization.gpu is an
     activity flag — it reads 100% while the card draws 43 W of a 130 W budget — so
@@ -378,6 +434,11 @@ def main() -> None:
     ap.add_argument("--density-still", action="store_true",
                     help="MEAS-5 through `benchmark` on one frame: no CPU quality metrics, "
                          "so it measures GPU encode rather than SSIM throughput")
+    ap.add_argument("--density-inproc", action="store_true",
+                    help="PERF-4: the same sweep as N threads in ONE process, timed on the "
+                         "steady state only. Runs it twice — sharing one device, then one "
+                         "device per stream — because that pair is what separates a process "
+                         "cost from a device cost")
     ap.add_argument("--hwenc", action="store_true", help="MEAS-5: the same sweep through NVENC/QSV")
     ap.add_argument("--all", action="store_true",
                     help="tier, then density-still, then hwenc. --density is opt-in (needs a clip)")
@@ -400,13 +461,15 @@ def main() -> None:
         sys.exit(f"No GNC binary at {args.binary} — run `cargo build --release` first.")
 
     adapters = list_adapters(args.binary)
-    if args.list or not (args.tier or args.density or args.density_still or args.hwenc or args.all):
+    if args.list or not (args.tier or args.density or args.density_still
+                         or args.density_inproc or args.hwenc or args.all):
         print(f"{len(adapters)} adapter(s) on {platform.system()} {platform.release()}:")
         for a in adapters:
             print(f"  {a['name']} [{a['backend']}, {a['kind']}]  "
                   f"→ GNC_GPU_ADAPTER={selector_for(a)}")
         if not args.list:
-            print("\nPick a mode: --tier, --density, --hwenc or --all. See --help.")
+            print("\nPick a mode: --tier, --density, --density-inproc, --hwenc or --all. "
+                  "See --help.")
         return
 
     levels = [int(x) for x in args.levels.split(",") if x.strip()]
@@ -466,6 +529,34 @@ def main() -> None:
                       "Concurrency converts idle GPU into useful GPU; it does not create GPU. "
                       "Sub-linear scaling is expected — the question is how far it goes before "
                       "it flattens.")
+
+    if args.density_inproc:
+        if not args.input:
+            sys.exit("--density-inproc needs -i <still frame>")
+        shared = density_inproc(args.binary, args.input, args.iterations, args.quality,
+                                levels, args.adapter, per_stream_device=False)
+        owned = density_inproc(args.binary, args.input, args.iterations, args.quality,
+                               levels, args.adapter, per_stream_device=True)
+        out["density_inproc_shared"] = shared
+        out["density_inproc_per_device"] = owned
+        for rows, label in ((shared, "one shared device"), (owned, "one device per stream")):
+            print_density(
+                f"PERF-4 (in-process, `gnc density`) — GNC q={args.quality}, "
+                f"{args.iterations} iterations/stream, {label}",
+                rows,
+            )
+            if any(r.get("megapixels_per_s") for r in rows):
+                print("\n| streams | Mpixel/s | per-stream fps | setup ms |")
+                print("|---|---|---|---|")
+                for r in rows:
+                    if not r.get("megapixels_per_s"):
+                        continue
+                    print(f"| {r['instances']} | {r['megapixels_per_s']:.1f} "
+                          f"| {r['per_stream_fps']:.2f} | {r['setup_ms']:.0f} |")
+        print("\n**Mpixel/s is the column that identifies the ceiling.** A fixed per-frame "
+              "overhead flattens in *fps* and would read the same at every resolution; a GPU "
+              "throughput limit flattens in *pixels per second*. Run this at two resolutions "
+              "before attributing the ceiling to anything.")
 
     if args.density_still or args.all:
         if not args.input:

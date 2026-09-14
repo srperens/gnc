@@ -3,8 +3,8 @@
 //! Gated behind `GNC_DIAGNOSTICS=1` env var or `--diagnostics` CLI flag.
 //! Zero overhead when disabled — all collection is behind runtime checks.
 
-use crate::{CompressedFrame, EntropyData, FrameType, GpuContext, MotionField, ResidualStats};
 use super::cfl;
+use crate::{CompressedFrame, EntropyData, FrameType, GpuContext, MotionField, ResidualStats};
 
 /// Bit budget breakdown: where the bytes go in a compressed frame.
 #[derive(Debug, Default)]
@@ -230,9 +230,9 @@ pub struct FrameDiagnostics {
 
     // Motion estimation (P/B frames)
     pub total_macroblocks: usize,
-    pub split_count: usize,       // blocks with block_size=8
-    pub skip_count: usize,        // blocks with MV=(0,0)
-    pub mv_raw: Option<MvStats>,  // raw MVs
+    pub split_count: usize,        // blocks with block_size=8
+    pub skip_count: usize,         // blocks with MV=(0,0)
+    pub mv_raw: Option<MvStats>,   // raw MVs
     pub mv_delta: Option<MvStats>, // delta MVs (after prediction) — future enhancement
 
     // B-frame specific
@@ -473,7 +473,12 @@ fn collect_bit_budget(frame: &CompressedFrame) -> BitBudget {
         }
     };
 
-    let total_bytes = mv_bytes + tile_header_bytes + coefficient_bytes + cfl_bytes + weight_map_bytes + intra_bytes;
+    let total_bytes = mv_bytes
+        + tile_header_bytes
+        + coefficient_bytes
+        + cfl_bytes
+        + weight_map_bytes
+        + intra_bytes;
 
     BitBudget {
         mv_bytes,
@@ -557,8 +562,16 @@ fn collect_rice_efficiency(entropy: &EntropyData) -> Option<RiceEfficiency> {
     // A more precise estimate: stream bits / avg_bits_per_coeff, but we compute it
     // from the total bits and total coefficients for an upper bound.
     let total_tiles = tiles.len();
-    let avg_k_mag = if k_count > 0 { k_mag_sum / k_count as f64 } else { 0.0 };
-    let avg_k_zrl = if k_count > 0 { k_zrl_sum / k_count as f64 } else { 0.0 };
+    let avg_k_mag = if k_count > 0 {
+        k_mag_sum / k_count as f64
+    } else {
+        0.0
+    };
+    let avg_k_zrl = if k_count > 0 {
+        k_zrl_sum / k_count as f64
+    } else {
+        0.0
+    };
 
     Some(RiceEfficiency {
         total_stream_bits,
@@ -580,7 +593,11 @@ fn collect_rice_efficiency(entropy: &EntropyData) -> Option<RiceEfficiency> {
 fn collect_warnings(diag: &mut FrameDiagnostics) {
     match diag.frame_type {
         FrameType::Predicted | FrameType::Bidirectional => {
-            let ft = if diag.frame_type == FrameType::Predicted { "P" } else { "B" };
+            let ft = if diag.frame_type == FrameType::Predicted {
+                "P"
+            } else {
+                "B"
+            };
 
             // P/B frame should be much smaller than I-frame
             if let Some(iframe_bytes) = diag.last_iframe_bytes {
@@ -633,9 +650,7 @@ fn collect_warnings(diag: &mut FrameDiagnostics) {
             }
 
             // Bit budget: P-frame coefficient data vs I-frame
-            if let (Some(ref bb), Some(iframe_bytes)) =
-                (&diag.bit_budget, diag.last_iframe_bytes)
-            {
+            if let (Some(ref bb), Some(iframe_bytes)) = (&diag.bit_budget, diag.last_iframe_bytes) {
                 if iframe_bytes > 0 && bb.coefficient_bytes > 0 {
                     let coeff_ratio = bb.coefficient_bytes as f64 / iframe_bytes as f64;
                     if coeff_ratio > 0.9 {
@@ -946,10 +961,30 @@ pub fn compute_temporal_wavelet(
         sum_abs_diff: f64,
     }
     let mut groups = [
-        Accum { count: 0, identical: 0, within_dz: 0, sum_abs_diff: 0.0 },
-        Accum { count: 0, identical: 0, within_dz: 0, sum_abs_diff: 0.0 },
-        Accum { count: 0, identical: 0, within_dz: 0, sum_abs_diff: 0.0 },
-        Accum { count: 0, identical: 0, within_dz: 0, sum_abs_diff: 0.0 },
+        Accum {
+            count: 0,
+            identical: 0,
+            within_dz: 0,
+            sum_abs_diff: 0.0,
+        },
+        Accum {
+            count: 0,
+            identical: 0,
+            within_dz: 0,
+            sum_abs_diff: 0.0,
+        },
+        Accum {
+            count: 0,
+            identical: 0,
+            within_dz: 0,
+            sum_abs_diff: 0.0,
+        },
+        Accum {
+            count: 0,
+            identical: 0,
+            within_dz: 0,
+            sum_abs_diff: 0.0,
+        },
     ];
 
     let dz_threshold = (qstep / 2.0) as f64;
@@ -1107,8 +1142,14 @@ pub fn print_temporal_gop_diagnostics(
         let avg_p = per_frame_quality.iter().map(|q| q.0).sum::<f64>() / n;
         let avg_s = per_frame_quality.iter().map(|q| q.1).sum::<f64>() / n;
         let consistency = if per_frame_quality.len() >= 2 {
-            let max_p = per_frame_quality.iter().map(|q| q.0).fold(f64::NEG_INFINITY, f64::max);
-            let min_p = per_frame_quality.iter().map(|q| q.0).fold(f64::INFINITY, f64::min);
+            let max_p = per_frame_quality
+                .iter()
+                .map(|q| q.0)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let min_p = per_frame_quality
+                .iter()
+                .map(|q| q.0)
+                .fold(f64::INFINITY, f64::min);
             max_p - min_p
         } else {
             0.0
@@ -1133,10 +1174,7 @@ pub fn print_temporal_gop_diagnostics(
         if baseline_bpp > 0.0 {
             let ratio = total_bpp / baseline_bpp;
             let saving_pct = (1.0 - ratio) * 100.0;
-            eprintln!(
-                "  Ratio vs all-I: {:.2} ({:+.0}%)",
-                ratio, -saving_pct
-            );
+            eprintln!("  Ratio vs all-I: {:.2} ({:+.0}%)", ratio, -saving_pct);
         }
     }
 
@@ -1145,25 +1183,36 @@ pub fn print_temporal_gop_diagnostics(
     eprintln!();
     eprintln!("  Temporal decomposition:");
     // For 5/3: high_frames[0][0] is s1 (second lowpass), not highpass
-    let effective_low_bytes = if is_53 && !group.high_frames.is_empty() && !group.high_frames[0].is_empty() {
-        low_bytes + group.high_frames[0][0].byte_size()
-    } else {
-        low_bytes
-    };
+    let effective_low_bytes =
+        if is_53 && !group.high_frames.is_empty() && !group.high_frames[0].is_empty() {
+            low_bytes + group.high_frames[0][0].byte_size()
+        } else {
+            low_bytes
+        };
     let effective_low_count = if is_53 { 2 } else { 1 };
     let _effective_high_bytes = total_bytes - effective_low_bytes;
 
-    let low_pct = if total_bytes > 0 { effective_low_bytes as f64 / total_bytes as f64 * 100.0 } else { 0.0 };
+    let low_pct = if total_bytes > 0 {
+        effective_low_bytes as f64 / total_bytes as f64 * 100.0
+    } else {
+        0.0
+    };
     let low_bpp = effective_low_bytes as f64 * 8.0 / pixels / effective_low_count as f64;
     eprintln!(
         "    Lowpass (L):   {} frame{} {:>7.1} KB  ({:.1}%)  avg_bpp={:.2}",
         effective_low_count,
         if effective_low_count != 1 { "s" } else { " " },
-        effective_low_bytes as f64 / 1024.0, low_pct, low_bpp
+        effective_low_bytes as f64 / 1024.0,
+        low_pct,
+        low_bpp
     );
 
     // Highpass levels (skip s1 from level 0 for 5/3)
-    for (lvl, (bytes, count)) in high_bytes_per_level.iter().zip(high_count_per_level.iter()).enumerate() {
+    for (lvl, (bytes, count)) in high_bytes_per_level
+        .iter()
+        .zip(high_count_per_level.iter())
+        .enumerate()
+    {
         let (adj_bytes, adj_count) = if is_53 && lvl == 0 && *count > 1 {
             // Subtract s1 (first frame in level 0) from highpass stats
             let s1_bytes = group.high_frames[0][0].byte_size();
@@ -1171,9 +1220,19 @@ pub fn print_temporal_gop_diagnostics(
         } else {
             (*bytes, *count)
         };
-        if adj_count == 0 { continue; }
-        let pct = if total_bytes > 0 { adj_bytes as f64 / total_bytes as f64 * 100.0 } else { 0.0 };
-        let avg_bpp = if adj_count > 0 { adj_bytes as f64 * 8.0 / pixels / adj_count as f64 } else { 0.0 };
+        if adj_count == 0 {
+            continue;
+        }
+        let pct = if total_bytes > 0 {
+            adj_bytes as f64 / total_bytes as f64 * 100.0
+        } else {
+            0.0
+        };
+        let avg_bpp = if adj_count > 0 {
+            adj_bytes as f64 * 8.0 / pixels / adj_count as f64
+        } else {
+            0.0
+        };
         eprintln!(
             "    Highpass L{}:   {} frame{} {:>7.1} KB  ({:.1}%)  avg_bpp={:.2}",
             lvl,
@@ -1202,7 +1261,11 @@ pub fn print_temporal_gop_diagnostics(
             } else {
                 format!("H{}", lvl)
             };
-            let idx = if is_53 && lvl == 0 && fi > 0 { fi - 1 } else { fi };
+            let idx = if is_53 && lvl == 0 && fi > 0 {
+                fi - 1
+            } else {
+                fi
+            };
             print_temporal_frame_detail(&label, idx, frame, width, height, skip_coeff);
         }
     }
@@ -1212,15 +1275,9 @@ pub fn print_temporal_gop_diagnostics(
         eprintln!();
         eprintln!("  Reconstructed quality:");
         for (i, (psnr, ssim)) in per_frame_quality.iter().enumerate() {
-            eprintln!(
-                "    frame {}: psnr={:.2} dB  ssim={:.4}",
-                i, psnr, ssim
-            );
+            eprintln!("    frame {}: psnr={:.2} dB  ssim={:.4}", i, psnr, ssim);
         }
-        eprintln!(
-            "    avg:     psnr={:.2} dB  ssim={:.4}",
-            avg_psnr, avg_ssim
-        );
+        eprintln!("    avg:     psnr={:.2} dB  ssim={:.4}", avg_psnr, avg_ssim);
     }
 
     // --- Warnings ---

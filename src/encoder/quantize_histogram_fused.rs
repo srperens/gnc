@@ -332,7 +332,11 @@ impl FusedQuantizeHistogram {
         if std::env::var("GNC_PROFILE").is_ok() {
             eprintln!(
                 "[fused_qh] dispatch {} (quantize_only={}, with_histogram={})",
-                if write_histogram { "main" } else { "main_quantize_only" },
+                if write_histogram {
+                    "main"
+                } else {
+                    "main_quantize_only"
+                },
                 n_qo + u32::from(!write_histogram),
                 n_hist + u32::from(write_histogram),
             );

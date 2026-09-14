@@ -42,6 +42,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fingerprint  # noqa: E402  (sibling script, not a package)
+
 REPO = Path(
     subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True,
                    check=True).stdout.strip()
@@ -105,6 +108,8 @@ def main():
     print(f"binary {GNC}")
     print(subprocess.run(["shasum", "-a", "256", str(GNC)], capture_output=True,
                          text=True).stdout.split()[0], "(hash-recorded before the sweep)")
+    fp = fingerprint.read(GNC)
+    print(f"codec-fingerprint {fp} — COORD-6: two numbers carrying the same one are comparable")
     print()
     hdr = (f"{'sequence':<16}{'q':>4}{'ki':>4}{'  ON (today)':>14}{'  OFF (control)':>16}"
            f"{'  per-GOP oracle':>17}{'  ON vs OFF':>12}{'  oracle vs ON':>15}{'  flips':>8}")
@@ -196,6 +201,7 @@ def main():
     print(f"points worse than the control: today {len(regress)} of {n} "
           f"({', '.join(f'{r[0]} q={r[1]} ki={r[2]}' for r in regress) or 'none'}), "
           f"per-GOP oracle {sum(1 for r in rows_out if r[5] > r[4])} of {n} (0 by construction)")
+    fingerprint.check_unchanged(GNC, fp)
     print(f"GOPs where the per-GOP choice differs from the per-frame one: "
           f"{sum(r[6] for r in rows_out)} of {sum(r[7] for r in rows_out)}")
 

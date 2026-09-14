@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>GNC — 4:4:4 vs 4:2:2 vs 4:2:0</title>
+<style>
+  :root { --bg:#2b2b2b; --panel:#333; --line:#444; --fg:#e6e6e6; --dim:#9b9b9b; --accent:#7fb4ff; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:28px 20px 60px; background:var(--bg); color:var(--fg);
+         font:14px/1.55 system-ui, -apple-system, sans-serif; }
+  .wrap { max-width:1180px; margin:0 auto; }
+  h1 { font-size:1.45em; margin:0 0 4px; font-weight:600; }
+  h2 { font-size:1.05em; margin:34px 0 10px; font-weight:600; }
+  .sub { color:var(--dim); margin:0 0 22px; }
+  a { color:var(--accent); }
+  nav { margin-bottom:18px; font-size:0.92em; }
+  .controls { display:flex; gap:10px; align-items:center; flex-wrap:wrap;
+              background:var(--panel); border:1px solid var(--line); border-radius:6px;
+              padding:10px 12px; margin-bottom:18px; }
+  button { background:#3c3c3c; color:var(--fg); border:1px solid var(--line); border-radius:4px;
+           padding:6px 12px; font:inherit; cursor:pointer; }
+  button.on { background:var(--accent); color:#12233d; border-color:var(--accent); font-weight:600; }
+  .grid { display:grid; grid-template-columns:repeat(4, minmax(0,1fr)); gap:14px; }
+  @media (max-width: 900px) { .grid { grid-template-columns:repeat(2, minmax(0,1fr)); } }
+  @media (max-width: 520px) { .grid { grid-template-columns:1fr; } }
+  figure { margin:0; background:var(--panel); border:1px solid var(--line); border-radius:6px;
+           padding:10px; }
+  figcaption { font-weight:600; margin-bottom:8px; }
+  /* Load-bearing: any smoothing here erases the 2x1 and 2x2 chroma blocks the page is about. */
+  img { width:100%; height:auto; display:block; border-radius:3px;
+        image-rendering: pixelated; image-rendering: crisp-edges; }
+  .nums { margin-top:8px; font-size:0.86em; color:var(--dim); }
+  .nums b { color:var(--fg); font-weight:600; }
+  .label { font-size:0.78em; color:var(--dim); text-transform:uppercase;
+           letter-spacing:0.05em; margin:10px 0 4px; }
+  p { max-width:78ch; }
+  .note { background:var(--panel); border-left:3px solid var(--accent); border-radius:0 5px 5px 0;
+          padding:12px 16px; margin:16px 0; }
+  code { background:#3a3a3a; padding:1px 5px; border-radius:3px; font-size:0.9em; }
+  table { border-collapse:collapse; margin:12px 0; font-size:0.9em; }
+  th, td { text-align:left; padding:5px 14px 5px 0; border-bottom:1px solid var(--line); }
+  th { color:var(--dim); font-weight:600; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <nav><a href="index.html">&larr; Stills</a> &nbsp;·&nbsp; <a href="player.html">Video player</a></nav>
+
+  <h1>How to see 4:4:4 vs 4:2:2 vs 4:2:0</h1>
+  <p class="sub" id="sub">Loading…</p>
+
+  <div class="controls">
+    <span>Quality:</span>
+    <button data-q="95" class="on">q=95</button>
+    <button data-q="50">q=50</button>
+    <span style="color:var(--dim)">— the difference is a resolution loss, so it barely moves with q. What moves is what it hides behind.</span>
+  </div>
+
+  <div class="grid" id="grid"></div>
+
+  <h2>What you are looking at</h2>
+  <p>The top row is the decoded picture, zoomed <span id="zoom">4</span>&times; with no smoothing.
+     The bottom row is <b>CIEDE2000 error against the source</b> for the same pixels — black is no
+     colour error, blue about 1, magenta about 2.5, white 5 and up. A dE00 of 1 is roughly the
+     threshold where a trained eye starts to notice on a flat field.</p>
+
+  <div class="note">
+    <b>The crop is not the whole frame, and that is the point.</b> Averaged over all of
+    <code id="srcname">bbb_1080p.png</code> the three encodes read
+    <span id="fullnums">…</span> — which sounds like a rounding error. Chroma subsampling does not
+    spread its damage evenly: it sits on saturated colour edges and costs nothing anywhere else.
+    This window was picked by maximising dE00(4:2:0) − dE00(4:4:4), so it lands where
+    <i>subsampling</i> hurts rather than where <i>quantisation</i> does.
+  </div>
+
+  <h2>Where to look, specifically</h2>
+  <p>GNC upsamples chroma with <b>nearest neighbour</b> — <code>chroma_upsample.wgsl</code> is
+     essentially <code>src[(dy&gt;&gt;shift_y) * src_width + (dx&gt;&gt;shift_x)]</code>. So the
+     artefact is <b>blocky, not blurry</b>: colour is constant across 2&times;1 blocks at 4:2:2 and
+     2&times;2 blocks at 4:2:0. Once you know to look for a staircase rather than a smudge it is
+     hard to unsee.</p>
+  <ul>
+    <li><b>4:4:4 → 4:2:2</b> loses horizontal chroma only. Look at <b>vertical</b> colour edges.</li>
+    <li><b>4:2:2 → 4:2:0</b> loses vertical chroma as well. Look at <b>horizontal</b> colour edges —
+        the top and bottom of a coloured object.</li>
+    <li>Best targets are saturated colour against neutral, and thin coloured detail.</li>
+  </ul>
+
+  <h2>Two traps</h2>
+  <p><b>Luma barely moves.</b> In YCoCg-R — the plane GNC actually codes — luma runs 52.95 → 52.51
+     → 52.33 dB across the three formats at q=95. The damage is entirely colour. But luma computed
+     from decoded <i>RGB</i> reads 54.34 → 48.07 → 46.04 dB, which looks like an 8 dB luma
+     collapse. It is contamination: perturb only Co/Cg and the reconstructed RGB moves, so BT.709
+     luma moves with it.</p>
+  <p><b>VMAF cannot see any of this.</b> It scores the luma plane only. On a chroma question your
+     eye is a better instrument than VMAF, and dE00 is better than both.</p>
+
+  <h2>The other half of the trade</h2>
+  <table id="rate"><thead><tr><th>format</th><th>bytes</th><th>vs 4:4:4</th><th>full-frame dE00</th></tr></thead><tbody></tbody></table>
+  <p>The question is never “can you see it”. It is “can you see it enough to be worth
+     <span id="saving">…</span>”.</p>
+
+  <p class="sub" style="margin-top:30px">Regenerate with
+     <code>examples/web/generate_chroma_ab.py</code>.</p>
+</div>
+
+<script>
+const FORMATS = [['444','4:4:4'], ['422','4:2:2'], ['420','4:2:0']];
+let stats = null, q = 95;
+
+function fmtBytes(n) {
+  return n >= 1e6 ? (n/1e6).toFixed(2) + ' MB' : (n/1e3).toFixed(0) + ' KB';
+}
+
+function render() {
+  const grid = document.getElementById('grid');
+  grid.innerHTML = '';
+
+  const src = document.createElement('figure');
+  src.innerHTML = `<figcaption>Source</figcaption>
+    <img src="chroma_ab/crop_source.png" alt="source crop">
+    <div class="label">reference</div>
+    <div class="nums">the picture the encoder was given</div>`;
+  grid.appendChild(src);
+
+  for (const [key, label] of FORMATS) {
+    const p = stats.panels[`${key}_${q}`];
+    const fig = document.createElement('figure');
+    fig.innerHTML = `<figcaption>${label}</figcaption>
+      <img src="chroma_ab/crop_${key}_${q}.png" alt="${label} decoded crop">
+      <div class="label">dE00 vs source</div>
+      <img src="chroma_ab/diff_${key}_${q}.png" alt="${label} error map">
+      <div class="nums">crop mean <b>${p.crop_mean.toFixed(2)}</b> ·
+        p95 <b>${p.crop_p95.toFixed(1)}</b><br>${fmtBytes(p.bytes)}</div>`;
+    grid.appendChild(fig);
+  }
+
+  const base = stats.panels[`444_${q}`];
+  const tbody = document.querySelector('#rate tbody');
+  tbody.innerHTML = '';
+  for (const [key, label] of FORMATS) {
+    const p = stats.panels[`${key}_${q}`];
+    const d = ((p.bytes - base.bytes) / base.bytes * 100);
+    tbody.insertAdjacentHTML('beforeend',
+      `<tr><td>${label}</td><td>${p.bytes.toLocaleString('en-US').replace(/,/g,' ')}</td>` +
+      `<td>${key === '444' ? '—' : d.toFixed(1) + '%'}</td>` +
+      `<td>${p.full_mean.toFixed(4)}</td></tr>`);
+  }
+  const worst = stats.panels[`420_${q}`];
+  document.getElementById('saving').textContent =
+    ((base.bytes - worst.bytes) / base.bytes * 100).toFixed(0) + '% of the bits';
+  document.getElementById('fullnums').textContent =
+    FORMATS.map(([k, l]) => `${l} ${stats.panels[`${k}_${q}`].full_mean.toFixed(4)}`).join(', ');
+}
+
+(async () => {
+  try {
+    stats = await (await fetch('chroma_ab/stats.json', {cache:'no-store'})).json();
+  } catch (e) {
+    document.getElementById('sub').textContent =
+      'No assets — run examples/web/generate_chroma_ab.py first.';
+    return;
+  }
+  const [x, y, w, h] = stats.crop;
+  document.getElementById('zoom').textContent = stats.zoom;
+  document.getElementById('srcname').textContent = stats.source;
+  document.getElementById('sub').textContent =
+    `${stats.source}, a ${w}×${h} crop at (${x}, ${y}), shown at ${stats.zoom}× with nearest-neighbour scaling.`;
+  render();
+  for (const b of document.querySelectorAll('.controls button')) {
+    b.addEventListener('click', () => {
+      q = Number(b.dataset.q);
+      document.querySelectorAll('.controls button').forEach(o => o.classList.toggle('on', o === b));
+      render();
+    });
+  }
+})();
+</script>
+</body>
+</html>

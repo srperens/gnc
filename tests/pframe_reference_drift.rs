@@ -31,9 +31,9 @@
 //! encodes, which is precisely the race that masked a real decoder bug in `abac_bitstream`
 //! (COORDINATION, BUG-21). Nothing in this file touches the environment.
 
+use gnc::bench::quality;
 use gnc::decoder::pipeline::DecoderPipeline;
 use gnc::encoder::pipeline::EncoderPipeline;
-use gnc::bench::quality;
 use gnc::{EntropyCoder, GpuContext};
 use std::sync::OnceLock;
 
@@ -52,7 +52,11 @@ fn synth(w: u32, h: u32) -> Vec<f32> {
             rng ^= rng >> 17;
             rng ^= rng << 5;
             let n = (rng % 24) as f32 - 12.0;
-            let fine = if ((x / 2) + (y / 3)) % 2 == 0 { 18.0 } else { 0.0 };
+            let fine = if ((x / 2) + (y / 3)) % 2 == 0 {
+                18.0
+            } else {
+                0.0
+            };
             let coarse = ((x / 40) * 37 % 200) as f32;
             let ramp = y as f32 / h as f32 * 120.0;
             d.push((coarse + ramp + fine + n).clamp(0.0, 255.0).round());
@@ -109,7 +113,9 @@ fn p_frame_quality_does_not_decay_along_a_gop() {
         "frame 0 must be the I-frame this GOP predicts from"
     );
     assert!(
-        cf[1..].iter().all(|f| f.frame_type == gnc::FrameType::Predicted),
+        cf[1..]
+            .iter()
+            .all(|f| f.frame_type == gnc::FrameType::Predicted),
         "frames 1..8 must all be P-frames, or this tests nothing: {:?}",
         cf.iter().map(|f| f.frame_type).collect::<Vec<_>>()
     );
@@ -133,6 +139,8 @@ fn p_frame_quality_does_not_decay_along_a_gop() {
         first_p,
         worst_p,
         last_p,
-        psnr.iter().map(|v| (v * 100.0).round() / 100.0).collect::<Vec<_>>()
+        psnr.iter()
+            .map(|v| (v * 100.0).round() / 100.0)
+            .collect::<Vec<_>>()
     );
 }

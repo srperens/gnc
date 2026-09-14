@@ -160,7 +160,11 @@ impl MedTransform {
         };
 
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some(if forward { "med_forward" } else { "med_inverse" }),
+            label: Some(if forward {
+                "med_forward"
+            } else {
+                "med_inverse"
+            }),
             timestamp_writes: None,
         });
         pass.set_pipeline(if forward {

@@ -224,7 +224,16 @@ pub fn run_multi_plane(
         ("Cg", &cg, chroma_w, chroma_h),
     ] {
         a_tot += abac_plane_bytes(
-            label, plane, w, h, tile_size, num_levels, cb, coder, &mut timing, &mut work,
+            label,
+            plane,
+            w,
+            h,
+            tile_size,
+            num_levels,
+            cb,
+            coder,
+            &mut timing,
+            &mut work,
         );
     }
     if rice_reference_bytes > 0 {

@@ -455,7 +455,7 @@ decimation rule was designed for.
   public cloud JPEG XS services or who rent JPEG XS devices. This is the single most concrete,
   defensible commercial argument GNC has.
 - **Scaling with GPU size rather than fixed-function block count** — sound in principle, unmeasured.
-- **In-browser decode of GNC's own bitstream** — true by construction; WebCodecs will never expose
+- **In-browser decode of GNC's own bitstream** — no longer only by construction: verified 2026-09-10 in Chrome and Safari on macOS, both containers, a full-length film (RESEARCH_LOG); WebCodecs will never expose
   a proprietary wavelet format.
 
 **Weak or overstated:**

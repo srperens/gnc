@@ -285,8 +285,7 @@ pub fn compute_weight_map(
 
     // Normalize by geometric mean so E[log(w)] = 0.
     // This preserves total bitrate since bits ∝ -log₂(step) and step ∝ weight.
-    let log_mean: f32 =
-        weights.iter().map(|w| w.max(0.001).ln()).sum::<f32>() / total as f32;
+    let log_mean: f32 = weights.iter().map(|w| w.max(0.001).ln()).sum::<f32>() / total as f32;
     let geo_factor = (-log_mean).exp();
     for w in &mut weights {
         *w = (*w * geo_factor).clamp(min_weight, max_weight);

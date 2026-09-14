@@ -489,10 +489,7 @@ impl DecoderPipeline {
                     // The MVs live on the luma split grid, whose stride is padded_w/block_size
                     // — not this chroma plane's own p_padded_w/(block_size/2), which differs
                     // whenever chroma pads to a different tile count than luma. (BUG-3)
-                    Some((
-                        padded_w / bufs.mc_block_size,
-                        padded_h / bufs.mc_block_size,
-                    )),
+                    Some((padded_w / bufs.mc_block_size, padded_h / bufs.mc_block_size)),
                 );
                 // Step 3: NN-upsample chroma_recon_buf → plane_results[p] (luma dims).
                 self.chroma_up.dispatch_upsample(
@@ -656,17 +653,35 @@ impl DecoderPipeline {
             padded_pixels as u32,
         );
 
-        // Inverse color (YCoCg-R → RGB)
-        self.color.dispatch(
-            ctx,
-            &mut cmd,
-            &bufs.ycocg_buf,
-            &bufs.rgb_out_buf,
-            padded_w,
-            padded_h,
-            false,
-            config.is_lossless(),
-        );
+        // Inverse colour — or not. **LOSSLESS-4 / GP21.** When the planes are the source's own
+        // Y'CbCr there is nothing to invert: applying the YCoCg-R inverse to them would produce a
+        // plausible wrong picture, which is exactly why the colour space is in the bitstream
+        // rather than inferred. The interleaved buffer is then already what the caller wants, and
+        // a copy keeps every stage downstream — crop, readback, the wasm player — unchanged.
+        match config.color_space {
+            crate::ColorSpace::YCoCgR => {
+                self.color.dispatch(
+                    ctx,
+                    &mut cmd,
+                    &bufs.ycocg_buf,
+                    &bufs.rgb_out_buf,
+                    padded_w,
+                    padded_h,
+                    false,
+                    config.is_lossless(),
+                );
+            }
+            crate::ColorSpace::YCbCrNative => {
+                log::debug!("decode: planes are Y'CbCr, no inverse colour transform (GP21)");
+                cmd.copy_buffer_to_buffer(
+                    &bufs.ycocg_buf,
+                    0,
+                    &bufs.rgb_out_buf,
+                    0,
+                    (padded_pixels * 3 * std::mem::size_of::<f32>()) as u64,
+                );
+            }
+        }
 
         // GPU crop: padded RGB → compact cropped output
         {

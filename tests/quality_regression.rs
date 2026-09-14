@@ -24,7 +24,9 @@ fn make_gradient(w: u32, h: u32) -> Vec<f32> {
         for x in 0..w {
             let r = (x as f32 / w as f32 * 255.0).round().clamp(0.0, 255.0);
             let g = (y as f32 / h as f32 * 255.0).round().clamp(0.0, 255.0);
-            let b = ((x + y) as f32 / (w + h) as f32 * 255.0).round().clamp(0.0, 255.0);
+            let b = ((x + y) as f32 / (w + h) as f32 * 255.0)
+                .round()
+                .clamp(0.0, 255.0);
             data.push(r);
             data.push(g);
             data.push(b);
@@ -296,7 +298,10 @@ fn regression_quality_monotonicity() {
 fn regression_quality_monotonicity_extended() {
     let ctx = gpu();
 
-    for (name, img) in [("gradient", make_gradient(512, 512)), ("checker", make_checkerboard(512, 512))] {
+    for (name, img) in [
+        ("gradient", make_gradient(512, 512)),
+        ("checker", make_checkerboard(512, 512)),
+    ] {
         let mut prev_psnr = 0.0f64;
         let mut prev_q = 0u32;
 

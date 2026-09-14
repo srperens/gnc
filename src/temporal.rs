@@ -47,9 +47,7 @@ pub(crate) fn haar_inverse(low: &[f32], high: &[f32]) -> (Vec<f32>, Vec<f32>) {
 
 /// Multi-level Haar forward over a group of 2^N frames.
 /// Returns (final low, highs_per_level) where level 0 is the finest split.
-pub fn haar_multilevel_forward(
-    frames: &[&[f32]],
-) -> (Vec<f32>, Vec<Vec<Vec<f32>>>) {
+pub fn haar_multilevel_forward(frames: &[&[f32]]) -> (Vec<f32>, Vec<Vec<Vec<f32>>>) {
     let n = frames.len();
     assert!(is_power_of_two(n), "Haar multilevel requires 2^N frames");
     let mut current: Vec<Vec<f32>> = frames.iter().map(|f| f.to_vec()).collect();
@@ -71,10 +69,7 @@ pub fn haar_multilevel_forward(
 }
 
 /// Multi-level Haar inverse for a group of 2^N frames.
-pub fn haar_multilevel_inverse(
-    low: &[f32],
-    highs_per_level: &[Vec<Vec<f32>>],
-) -> Vec<Vec<f32>> {
+pub fn haar_multilevel_inverse(low: &[f32], highs_per_level: &[Vec<Vec<f32>>]) -> Vec<Vec<f32>> {
     let mut current: Vec<Vec<f32>> = vec![low.to_vec()];
     for level in (0..highs_per_level.len()).rev() {
         let highs = &highs_per_level[level];

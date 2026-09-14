@@ -81,14 +81,22 @@ pub const RICE_MAX_K: u8 = 15;
 /// Bits set for every group present in a tile, used to detect "all groups skipped".
 pub fn all_groups_mask(num_groups: u32) -> u16 {
     let ng = num_groups.min(16);
-    if ng >= 16 { u16::MAX } else { (1u16 << ng) - 1 }
+    if ng >= 16 {
+        u16::MAX
+    } else {
+        (1u16 << ng) - 1
+    }
 }
 
 /// The skip bitmap stays one byte for the ≤8-group tiles every stream used before
 /// 5 wavelet levels existed; wider tiles spend a second byte. `num_groups` is already
 /// in the tile header, so no generation flag is needed to tell the two apart.
 fn skip_bitmap_bytes(num_groups: u32) -> usize {
-    if num_groups > 8 { 2 } else { 1 }
+    if num_groups > 8 {
+        2
+    } else {
+        1
+    }
 }
 
 /// Stride of the serialised per-odd-stream k block. Tiles with ≤8 groups keep the 8-entry
@@ -108,7 +116,11 @@ fn take_bytes(data: &[u8], pos: &mut usize, n: usize) -> Vec<u8> {
 }
 
 fn ck_stride(num_groups: u32) -> usize {
-    if num_groups > 8 { RICE_MAX_GROUPS } else { 8 }
+    if num_groups > 8 {
+        RICE_MAX_GROUPS
+    } else {
+        8
+    }
 }
 
 fn write_skip_bitmap(out: &mut Vec<u8>, bitmap: u16, num_groups: u32) {
@@ -122,7 +134,11 @@ fn write_skip_bitmap(out: &mut Vec<u8>, bitmap: u16, num_groups: u32) {
 fn read_skip_bitmap(data: &[u8], pos: &mut usize, num_groups: u32) -> u16 {
     let n = skip_bitmap_bytes(num_groups);
     let b = take_bytes(data, pos, n);
-    if n == 2 { u16::from_le_bytes([b[0], b[1]]) } else { b[0] as u16 }
+    if n == 2 {
+        u16::from_le_bytes([b[0], b[1]])
+    } else {
+        b[0] as u16
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -155,8 +171,7 @@ impl RiceTile {
         let flags = 1; // flags byte
 
         // Check if all-skip
-        let all_empty = self.stream_data.is_empty()
-            && self.stream_lengths.iter().all(|&l| l == 0);
+        let all_empty = self.stream_data.is_empty() && self.stream_lengths.iter().all(|&l| l == 0);
         let all_mask = all_groups_mask(self.num_groups);
         let all_skip = all_empty && (self.skip_bitmap & all_mask == all_mask);
         let bitmap_bytes = skip_bitmap_bytes(self.num_groups);
@@ -165,8 +180,13 @@ impl RiceTile {
             // flags + skip_bitmap
             fixed_header + flags + bitmap_bytes
         } else {
-            let k_params = self.k_values.len() + self.k_zrl_nz_values.len() + self.k_zrl_z_values.len() + bitmap_bytes;
-            let varint_bytes: usize = self.stream_lengths.iter()
+            let k_params = self.k_values.len()
+                + self.k_zrl_nz_values.len()
+                + self.k_zrl_z_values.len()
+                + bitmap_bytes;
+            let varint_bytes: usize = self
+                .stream_lengths
+                .iter()
                 .map(|&l| varint_size(l as u16))
                 .sum();
             let (_, len_bits) = best_length_k(&self.stream_lengths);
@@ -445,7 +465,11 @@ pub fn rice_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32) -
 
             let coeff = coefficients[coeff_idx];
             if coeff == 0 {
-                let k = if last_mag_large { k_zrl_nz_values[g] } else { k_zrl_z_values[g] };
+                let k = if last_mag_large {
+                    k_zrl_nz_values[g]
+                } else {
+                    k_zrl_z_values[g]
+                };
                 let mut run = 1u32;
                 let mut ns = s + 1;
                 while ns < symbols_per_stream {
@@ -454,8 +478,13 @@ pub fn rice_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32) -
                     let ny = (next_idx / tile_size as usize) as u32;
                     let nx = (next_idx % tile_size as usize) as u32;
                     let ng = compute_subband_group(nx, ny, tile_size, num_levels);
-                    if (skip_bitmap >> ng) & 1 == 1 { ns += 1; continue; }
-                    if coefficients[next_idx] != 0 { break; }
+                    if (skip_bitmap >> ng) & 1 == 1 {
+                        ns += 1;
+                        continue;
+                    }
+                    if coefficients[next_idx] != 0 {
+                        break;
+                    }
                     run += 1;
                     ns += 1;
                 }
@@ -468,7 +497,11 @@ pub fn rice_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32) -
                 writer.write_bit(if coeff < 0 { 1 } else { 0 });
                 let magnitude = coeff.unsigned_abs() - 1;
                 let ema_mean = ema[g] >> 4;
-                let k = if ema_mean > 0 { (31 - ema_mean.leading_zeros()).min(15) as u8 } else { 0 };
+                let k = if ema_mean > 0 {
+                    (31 - ema_mean.leading_zeros()).min(15) as u8
+                } else {
+                    0
+                };
                 writer.write_rice(magnitude, k);
                 ema[g] = ema[g] - (ema[g] >> 3) + (magnitude << 1);
                 s += 1;
@@ -491,7 +524,11 @@ pub fn rice_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32) -
     for odd_idx in 0..128usize {
         let even_idx = odd_idx; // neighbor even stream index
         for g in 0..ck_stride {
-            let global_k = if g < num_groups { k_values[g] as u32 } else { 0 };
+            let global_k = if g < num_groups {
+                k_values[g] as u32
+            } else {
+                0
+            };
             let neighbor_mean = even_final_ema[even_idx][g] >> 4;
             let neighbor_k = if neighbor_mean > 0 {
                 (31 - neighbor_mean.leading_zeros()).min(15)
@@ -541,7 +578,11 @@ pub fn rice_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32) -
 
             let coeff = coefficients[coeff_idx];
             if coeff == 0 {
-                let k = if last_mag_large { k_zrl_nz_values[g] } else { k_zrl_z_values[g] };
+                let k = if last_mag_large {
+                    k_zrl_nz_values[g]
+                } else {
+                    k_zrl_z_values[g]
+                };
                 let mut run = 1u32;
                 let mut ns = s + 1;
                 while ns < symbols_per_stream {
@@ -550,8 +591,13 @@ pub fn rice_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32) -
                     let ny = (next_idx / tile_size as usize) as u32;
                     let nx = (next_idx % tile_size as usize) as u32;
                     let ng = compute_subband_group(nx, ny, tile_size, num_levels);
-                    if (skip_bitmap >> ng) & 1 == 1 { ns += 1; continue; }
-                    if coefficients[next_idx] != 0 { break; }
+                    if (skip_bitmap >> ng) & 1 == 1 {
+                        ns += 1;
+                        continue;
+                    }
+                    if coefficients[next_idx] != 0 {
+                        break;
+                    }
                     run += 1;
                     ns += 1;
                 }
@@ -564,7 +610,11 @@ pub fn rice_encode_tile(coefficients: &[i32], tile_size: u32, num_levels: u32) -
                 writer.write_bit(if coeff < 0 { 1 } else { 0 });
                 let magnitude = coeff.unsigned_abs() - 1;
                 let ema_mean = ema[g] >> 4;
-                let k = if ema_mean > 0 { (31 - ema_mean.leading_zeros()).min(15) as u8 } else { 0 };
+                let k = if ema_mean > 0 {
+                    (31 - ema_mean.leading_zeros()).min(15) as u8
+                } else {
+                    0
+                };
                 writer.write_rice(magnitude, k);
                 ema[g] = ema[g] - (ema[g] >> 3) + (magnitude << 1);
                 s += 1;
@@ -639,8 +689,7 @@ pub fn rice_decode_tile(tile: &RiceTile) -> Vec<i32> {
         let mut s = 0usize;
         let mut last_mag_large = false;
         while s < symbols_per_stream {
-            let coeff_idx =
-                stream_coeff_index(stream_id, s, symbols_per_stream, tile_size);
+            let coeff_idx = stream_coeff_index(stream_id, s, symbols_per_stream, tile_size);
             let cy = (coeff_idx / tile_size) as u32;
             let cx = (coeff_idx % tile_size) as u32;
             let cur_g = compute_subband_group(cx, cy, tile.tile_size, tile.num_levels);
@@ -660,8 +709,7 @@ pub fn rice_decode_tile(tile: &RiceTile) -> Vec<i32> {
                 let mut written = 0u32;
                 let mut ws = s;
                 while written < run && ws < symbols_per_stream {
-                    let wi =
-                        stream_coeff_index(stream_id, ws, symbols_per_stream, tile_size);
+                    let wi = stream_coeff_index(stream_id, ws, symbols_per_stream, tile_size);
                     let wy = (wi / tile_size) as u32;
                     let wx = (wi % tile_size) as u32;
                     let wg = compute_subband_group(wx, wy, tile.tile_size, tile.num_levels);
@@ -687,7 +735,11 @@ pub fn rice_decode_tile(tile: &RiceTile) -> Vec<i32> {
                 };
                 let rice_val = reader.read_rice(k);
                 let magnitude = rice_val + 1;
-                coefficients[coeff_idx] = if sign == 1 { -(magnitude as i32) } else { magnitude as i32 };
+                coefficients[coeff_idx] = if sign == 1 {
+                    -(magnitude as i32)
+                } else {
+                    magnitude as i32
+                };
                 ema[g] = ema[g] - (ema[g] >> 3) + (rice_val << 1);
                 s += 1;
                 last_mag_large = rice_val >= 1;
@@ -821,7 +873,13 @@ fn read_tile_varint(data: &[u8], pos: &mut usize) -> u16 {
 
 /// Compute varint byte size for a u16 value.
 fn varint_size(val: u16) -> usize {
-    if val < 0x80 { 1 } else if val < 0x4000 { 2 } else { 3 }
+    if val < 0x80 {
+        1
+    } else if val < 0x4000 {
+        2
+    } else {
+        3
+    }
 }
 
 pub fn serialize_tile_rice(tile: &RiceTile) -> Vec<u8> {
@@ -833,8 +891,7 @@ pub fn serialize_tile_rice(tile: &RiceTile) -> Vec<u8> {
     out.extend_from_slice(&tile.num_groups.to_le_bytes());
 
     // Check if tile is all-skip (all streams empty)
-    let all_empty = tile.stream_data.is_empty()
-        && tile.stream_lengths.iter().all(|&l| l == 0);
+    let all_empty = tile.stream_data.is_empty() && tile.stream_lengths.iter().all(|&l| l == 0);
     let all_mask = all_groups_mask(tile.num_groups);
     let all_skip = all_empty && (tile.skip_bitmap & all_mask == all_mask);
 
@@ -855,7 +912,11 @@ pub fn serialize_tile_rice(tile: &RiceTile) -> Vec<u8> {
         let rice_lengths = (4 + len_bits).div_ceil(8) < varint_bytes;
         let flags_byte = TILE_FLAG_COMPACT_STREAMS
             | if has_ck { TILE_FLAG_CHECKERBOARD_K } else { 0 }
-            | if rice_lengths { TILE_FLAG_RICE_LENGTHS } else { 0 };
+            | if rice_lengths {
+                TILE_FLAG_RICE_LENGTHS
+            } else {
+                0
+            };
         out.push(flags_byte);
 
         // k values + k_zrl_nz + k_zrl_z + skip_bitmap
@@ -867,8 +928,11 @@ pub fn serialize_tile_rice(tile: &RiceTile) -> Vec<u8> {
         // Checkerboard per-odd-stream k (1024 bytes = 128 odd streams × 8 groups,
         // only when TILE_FLAG_CHECKERBOARD_K set)
         if has_ck {
-            debug_assert_eq!(tile.k_stream_odd.len(), 128 * ck_stride(tile.num_groups),
-                "k_stream_odd must hold 128 odd streams × ck_stride groups");
+            debug_assert_eq!(
+                tile.k_stream_odd.len(),
+                128 * ck_stride(tile.num_groups),
+                "k_stream_odd must hold 128 odd streams × ck_stride groups"
+            );
             out.extend_from_slice(&tile.k_stream_odd);
         }
 
@@ -1129,7 +1193,10 @@ mod tests {
         let clean = serialize_tile_rice(&tile);
 
         let (parsed, _) = deserialize_tile_rice(&clean);
-        assert!(!parsed.k_values.is_empty(), "need a tile with k blocks to corrupt");
+        assert!(
+            !parsed.k_values.is_empty(),
+            "need a tile with k blocks to corrupt"
+        );
 
         // Corrupt every byte of the header region in turn rather than hard-coding where the
         // k blocks start: the invariant is "no k above RICE_MAX_K, whatever the bytes say",
@@ -1219,7 +1286,9 @@ mod tests {
             ),
             (
                 "uniform large",
-                (0..RICE_STREAMS_PER_TILE).map(|i| 1000 + i as u32).collect(),
+                (0..RICE_STREAMS_PER_TILE)
+                    .map(|i| 1000 + i as u32)
+                    .collect(),
             ),
         ];
         for (name, lengths) in cases {

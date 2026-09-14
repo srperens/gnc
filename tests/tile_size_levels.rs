@@ -85,7 +85,10 @@ fn lossless_uses_med_prediction_not_the_wavelet() {
     let cfg = quality_preset(100);
     assert_eq!(cfg.transform_type, gnc::TransformType::MedPredict);
     assert_eq!(cfg.wavelet_levels, 0);
-    assert!(cfg.is_lossless(), "the MED path must still count as lossless");
+    assert!(
+        cfg.is_lossless(),
+        "the MED path must still count as lossless"
+    );
     assert!(!cfg.adaptive_quantization);
     assert!(!cfg.cfl_enabled);
 }

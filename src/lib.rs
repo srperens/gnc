@@ -4,6 +4,7 @@ pub mod bench;
 pub mod decoder;
 pub mod encoder;
 pub mod experiments;
+pub mod fingerprint;
 pub mod format;
 pub mod gpu_util;
 pub mod image_util;
@@ -19,6 +20,47 @@ pub enum ChromaFormat {
     Yuv422,
     /// 4:2:0 — Co and Cg halved in both horizontal and vertical
     Yuv420,
+}
+
+/// What the three coded planes actually are.
+///
+/// **LOSSLESS-4.** GNC's native path converts RGB to YCoCg-R, which is integer-reversible and
+/// right for RGB sources. A Y4M source is not an RGB source: the reader applies BT.601 to get RGB
+/// first, and that conversion is both lossy in principle — the matrix is not integer-invertible,
+/// so the file's own Y'CbCr samples cannot be returned — and expensive in practice. Measured
+/// 2026-09-11 over four sequences at q=100: coding the planes as they arrive costs **39.2% fewer
+/// bits** than coding the RGB they convert to (−37.0% to −43.1%, four of four), which independently
+/// matches FFV1's own +64.2% penalty for being told to code RGB instead of YUV.
+///
+/// So a planar source is coded as it arrives, and the container records which it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ColorSpace {
+    /// Planes are YCoCg-R, produced from RGB input by the reversible forward transform.
+    #[default]
+    YCoCgR,
+    /// Planes are the source's own Y'CbCr, coded verbatim. No colour transform at either end.
+    YCbCrNative,
+}
+
+impl ColorSpace {
+    /// Byte written into the header from GP21 onwards.
+    pub fn to_byte(self) -> u8 {
+        match self {
+            ColorSpace::YCoCgR => 0,
+            ColorSpace::YCbCrNative => 1,
+        }
+    }
+
+    /// Inverse of [`to_byte`]. Anything unknown is refused rather than guessed: a wrong colour
+    /// space is a plausible wrong picture, not an error, which is the failure mode `0074` spells
+    /// out for generations and the reason this is not a boolean.
+    pub fn from_byte(b: u8) -> Option<Self> {
+        match b {
+            0 => Some(ColorSpace::YCoCgR),
+            1 => Some(ColorSpace::YCbCrNative),
+            _ => None,
+        }
+    }
 }
 
 impl ChromaFormat {
@@ -235,7 +277,11 @@ impl SubbandWeights {
         for i in 0..levels as usize {
             let j = if physical { levels as usize - 1 - i } else { i };
             let lh_hl = 1.0 + 0.5 * j as f32;
-            let is_target = if physical { i == 0 } else { i == levels as usize - 1 };
+            let is_target = if physical {
+                i == 0
+            } else {
+                i == levels as usize - 1
+            };
             let hh = (lh_hl + if is_target { 1.0 } else { 0.5 }) * hh_scale;
             detail.push([lh_hl, lh_hl, hh]);
         }
@@ -521,6 +567,10 @@ pub struct CodecConfig {
     pub adaptive_temporal_mul: bool,
     /// Chroma subsampling format (default: Yuv444 = no subsampling).
     pub chroma_format: ChromaFormat,
+    /// What the coded planes are: YCoCg-R from RGB (default), or the source's own Y'CbCr
+    /// coded verbatim. See [`ColorSpace`] — the native path is worth 39.2% of the rate on a
+    /// Y4M source and is the only way the file's own samples survive the round trip.
+    pub color_space: ColorSpace,
     /// Bit depth of the input/output signal (8 or 10). Default: 8.
     /// Affects FrameInfo.bit_depth, PSNR normalisation, and save/load helpers.
     pub bit_depth: u32,
@@ -681,6 +731,7 @@ impl Default for CodecConfig {
             temporal_highpass_qstep_mul: 2.0,
             adaptive_temporal_mul: true,
             chroma_format: ChromaFormat::Yuv444,
+            color_space: ColorSpace::YCoCgR,
             bit_depth: 8,
             scene_cut_threshold: 50.0,
             overlap_pixels: 0,
@@ -836,10 +887,11 @@ pub const MAX_TILE_SIZE: u32 = 512;
 ///   sequence at ki=1 loses nothing at all (-5.65% of rate, PSNR identical), which is what
 ///   pins the cause to the reference rather than to the coding.
 ///
-/// `GNC_PAD_FILL=decay` / `=replicate` forces either mode on every path, overriding both
+/// `GNC_PAD_FILL=decay` / `=replicate` / `=zero` forces a mode on every path, overriding both
 /// defaults. That is not a tuning knob: it is what `scripts/meas_intra1_padding.py` and
-/// `scripts/meas_pad1_inter.py` need to run both arms, and forcing `decay` on a P-chain is
-/// measured to be a bad trade.
+/// `scripts/meas_pad1_inter.py` need to run the arms. Forcing `decay` on a P-chain is
+/// measured to be a bad trade. `zero` is PAD-2's Dirac/Schroedinger candidate (inter
+/// zero-extend) and is not a default.
 ///
 /// This is an **encoder-side choice with no bitstream implication**: `pad.wgsl` is compiled only
 /// in `src/encoder/pipeline.rs`, the decoder reconstructs whatever was coded, and both sides
@@ -852,8 +904,16 @@ pub fn pad_fill_mode(default_decay: bool) -> u32 {
         // still-image path, false is the shared buffer every sequence path uses as-is.
         eprintln!(
             "GNC: pad fill = {} (path default {}, {})",
-            if mode == 1 { "decay" } else { "replicate" },
-            if default_decay { "decay/intra" } else { "replicate/sequence" },
+            match mode {
+                1 => "decay",
+                2 => "zero",
+                _ => "replicate",
+            },
+            if default_decay {
+                "decay/intra"
+            } else {
+                "replicate/sequence"
+            },
             match std::env::var("GNC_PAD_FILL") {
                 Ok(v) => format!("GNC_PAD_FILL={v}"),
                 Err(_) => "no override".to_string(),
@@ -867,10 +927,11 @@ fn pad_fill_mode_inner(default_decay: bool) -> u32 {
     match std::env::var("GNC_PAD_FILL").as_deref() {
         Ok("replicate") => 0,
         Ok("decay") => 1,
+        Ok("zero") => 2,
         Err(_) => u32::from(default_decay),
         Ok(other) => {
             eprintln!(
-                "GNC: unknown GNC_PAD_FILL={other:?}; expected \"decay\" or \"replicate\". \
+                "GNC: unknown GNC_PAD_FILL={other:?}; expected \"decay\", \"replicate\" or \"zero\". \
                  Using the per-path default."
             );
             u32::from(default_decay)
@@ -1012,21 +1073,38 @@ pub fn lossless_sibling(cfg: &CodecConfig) -> CodecConfig {
         EntropyCoder::Rans => EntropyCoder::Rice,
         other => other,
     };
+    // **BUG-46: the chroma format is a "how", not a "how much".** Without this the sibling was
+    // always `quality_preset(100)`'s 4:4:4, so on subsampled input RATE-2 compared a 4:2:0 wavelet
+    // encode against a **4:4:4** lossless one — three times the chroma samples — and reported the
+    // same candidate size for both requests (3 257 157 B on bbb at q=97, whether the caller asked
+    // for 4:4:4 or 4:2:0). The fallback could therefore essentially never fire off 4:4:4, and if
+    // it ever had, the output would have carried a chroma format the caller did not ask for.
+    // "Bit-exact" here means exact in the domain the caller chose to code in, which is what makes
+    // the two candidates comparable at all.
+    out.chroma_format = cfg.chroma_format;
     out.gpu_entropy_encode = cfg.gpu_entropy_encode;
     out.abac_coder = cfg.abac_coder;
     out.abac_code_block = cfg.abac_code_block;
     out.abac_gpu_sizing = cfg.abac_gpu_sizing;
     out.set_tile_size(cfg.tile_size);
-    // **The padding fill is one of those choices, and dropping it was a defect.** `0039` made
-    // `pad_fill_decay` a still-image lever and the sequence encoder clears it for every I-frame
-    // something predicts from; `quality_preset(100)` sets it back to `true`, so a sibling that
-    // did not inherit it was coded with *decay*-filled padding while the frame it stands in for
-    // was replicate-filled. Two consequences, and neither was visible before RATE-4 built a
-    // reference from the source: the kept bit-exact I-frame contradicted the sequence encoder's
-    // own decision, and the two candidates left *different* padded sources in `input_buf`.
-    // Measured: forcing both fills to agree makes 24 of 24 sequence points byte-identical
-    // between the source-built and reconstructed reference; without it, 10 move.
-    out.pad_fill_decay = cfg.pad_fill_decay;
+    // **The padding fill is an AND of two decisions, and each one is measured.**
+    //
+    // `quality_preset(100)` already clears it for the MED path (BUG-48) and deliberately keeps it
+    // for the lossless *wavelet* path, where decay is still worth **−4.64%** on four stills —
+    // PAD-1's figure reproduced at the top of the ladder. So the sibling must not force `false`:
+    // that would hand the `GNC_MED=0` arm a 4.6% regression. An earlier version of this line did
+    // exactly that and the measurement in `quality_preset` above is what refutes it.
+    //
+    // Nor may it simply take the caller's value, which is what BUG-47 shipped: `quality_preset(100)`
+    // set it to `true` while the sequence encoder had cleared it for every referenced I-frame, so
+    // the two candidates left *differently padded* sources in `input_buf` and 10 of 24 sequence
+    // points moved.
+    //
+    // `&=` is both: decay only where the preset asks for it **and** the caller allows it. MED stays
+    // replicate; a lossless-wavelet still keeps its −4.64%; a sequence keyframe, where the caller
+    // has cleared the flag, is replicate in both candidates, which is what the source-built
+    // reference of `0072` needs.
+    out.pad_fill_decay &= cfg.pad_fill_decay;
     // Without this the sibling would ask for a sibling of its own.
     out.lossless_fallback = false;
     out
@@ -1046,12 +1124,48 @@ pub fn quality_preset(q: u32) -> CodecConfig {
     let anchors: &[Anchor] = &[
         // CfL disabled at extreme compression: alpha precision hurts more than
         // chroma prediction helps at high qstep
-        Anchor { q: 1,   qstep: 64.0, dead_zone: 1.0,  cfl: false, per_subband: true },
-        Anchor { q: 10,  qstep: 32.0, dead_zone: 0.75, cfl: false, per_subband: true }, // CfL alpha precision too coarse at high qstep
-        Anchor { q: 25,  qstep: 16.0, dead_zone: 0.75, cfl: false, per_subband: true }, // CfL alpha too coarse at qstep=16; hurts gradients
-        Anchor { q: 50,  qstep: 8.0,  dead_zone: 0.75, cfl: true,  per_subband: true },
-        Anchor { q: 75,  qstep: 4.0,  dead_zone: 0.75, cfl: true,  per_subband: true },
-        Anchor { q: 85,  qstep: 2.8,  dead_zone: 0.5,  cfl: true,  per_subband: true },
+        Anchor {
+            q: 1,
+            qstep: 64.0,
+            dead_zone: 1.0,
+            cfl: false,
+            per_subband: true,
+        },
+        Anchor {
+            q: 10,
+            qstep: 32.0,
+            dead_zone: 0.75,
+            cfl: false,
+            per_subband: true,
+        }, // CfL alpha precision too coarse at high qstep
+        Anchor {
+            q: 25,
+            qstep: 16.0,
+            dead_zone: 0.75,
+            cfl: false,
+            per_subband: true,
+        }, // CfL alpha too coarse at qstep=16; hurts gradients
+        Anchor {
+            q: 50,
+            qstep: 8.0,
+            dead_zone: 0.75,
+            cfl: true,
+            per_subband: true,
+        },
+        Anchor {
+            q: 75,
+            qstep: 4.0,
+            dead_zone: 0.75,
+            cfl: true,
+            per_subband: true,
+        },
+        Anchor {
+            q: 85,
+            qstep: 2.8,
+            dead_zone: 0.5,
+            cfl: true,
+            per_subband: true,
+        },
         // The ladder used to flatten here: q=92 and q=99 both sat at qstep ~2.0, so q=92, 96
         // and 99 produced the *same picture* and the entire top of the lossy range was
         // unreachable. The floor came from rANS — its GPU alphabet cannot represent the symbol
@@ -1083,11 +1197,35 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         // bitstream's entropy_type confirms it.
         // q<=92 is deliberately left exactly as it was, so no existing quality point moves;
         // only the previously dead range above it changes.
-        Anchor { q: 92,  qstep: 2.05, dead_zone: 0.05, cfl: false, per_subband: true },
-        Anchor { q: 96,  qstep: 1.30, dead_zone: 0.0,  cfl: false, per_subband: true },
-        Anchor { q: 99,  qstep: 0.75, dead_zone: 0.0,  cfl: false, per_subband: true },
+        Anchor {
+            q: 92,
+            qstep: 2.05,
+            dead_zone: 0.05,
+            cfl: false,
+            per_subband: true,
+        },
+        Anchor {
+            q: 96,
+            qstep: 1.30,
+            dead_zone: 0.0,
+            cfl: false,
+            per_subband: true,
+        },
+        Anchor {
+            q: 99,
+            qstep: 0.75,
+            dead_zone: 0.0,
+            cfl: false,
+            per_subband: true,
+        },
         // Lossless: LeGall 5/3 with integer-exact lifting
-        Anchor { q: 100, qstep: 1.0,  dead_zone: 0.0,  cfl: false, per_subband: true },
+        Anchor {
+            q: 100,
+            qstep: 1.0,
+            dead_zone: 0.0,
+            cfl: false,
+            per_subband: true,
+        },
     ];
 
     // Find surrounding anchors and interpolation factor
@@ -1283,10 +1421,27 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         //
         // Only 4:4:4: the rANS GPU path assumes all three planes share the luma tile layout.
         // `normalize_for_chroma` falls back to Rice for subsampled formats.
+        // **ENT-10, 2026-09-14: above the rANS cutoff the default is abac** (`docs/decisions/0053`,
+        // superseding `0052`'s refusal once ENT-14 removed the reason for it).
+        //
+        // It codes **11.9% to 20.7% fewer bits than Rice at identical pixels** — entropy coding is
+        // lossless over the same quantised coefficients, and the measured PSNR delta is 0.00 dB in
+        // every channel at every point — for 1.7x-5.4x encode and 1.0x-2.3x decode. Measured over
+        // three photographic stills at q ∈ {25,50,75,85,90,95,99}, four sequences at q ∈ {90,95,99},
+        // a **held static shot** (−16.7% / −16.9%, the case GOALS says should cost almost nothing
+        // and which nobody had measured), and a sparse synthetic gradient (**−8.7% to −27.9%**,
+        // which read **+234.5%** before ENT-14).
+        //
+        // **The cutoff is unchanged, and that is a finding rather than a convenience.** abac loses
+        // to rANS below it and wins above it, on all three images, at the same q where rANS already
+        // stopped being the default. Measured before ENT-14, so these are its floor: q=15 read
+        // +5.8% / +0.3% / −0.1%, q=20 read +1.6% / −2.8% / −3.4%, q=25 read −6.0% / −7.2% / −7.9%.
+        // Whatever makes rANS strong at four decomposition levels makes abac weak there too, so one
+        // boundary serves both — **the three constants move together if any of them moves.**
         entropy_coder: if q <= 20 {
             EntropyCoder::Rans
         } else {
-            EntropyCoder::Rice
+            EntropyCoder::Abac
         },
         per_subband_entropy: disc.per_subband,
         adaptive_quantization: aq_enabled,
@@ -1302,10 +1457,14 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         // every image measured, so the second encode would be pure cost. `GNC_LOSSLESS_FALLBACK=0`
         // restores the old behaviour for measurement.
         lossless_fallback: (95..100).contains(&q)
-            && std::env::var("GNC_LOSSLESS_FALLBACK").map(|v| v != "0").unwrap_or(true),
+            && std::env::var("GNC_LOSSLESS_FALLBACK")
+                .map(|v| v != "0")
+                .unwrap_or(true),
         // PAD-1: this preset serves the still-image path, where there is no reference frame and
         // fading the padding flat is worth -4.63% RGB of rate at identical visible quality. The
         // sequence encoder clears it for the I-frames it codes, because those *are* references.
+        //
+        // **BUG-48 turns it off for a bit-exact preset — see below the struct.**
         pad_fill_decay: true,
         dct_freq_strength: 7.0,
         // Intra prediction is off by default: measured at -11.76 dB / +29% bitrate on lossy
@@ -1313,7 +1472,9 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         // would find. That measurement says nothing about q=100, where there is no quantiser,
         // the transform is reversible, and prediction is exactly the tool FFV1 and x264-lossless
         // use to beat this codec by 27-43%. GNC_INTRA_PRED=1 exposes it for measurement.
-        intra_prediction: std::env::var("GNC_INTRA_PRED").map(|v| v == "1").unwrap_or(false),
+        intra_prediction: std::env::var("GNC_INTRA_PRED")
+            .map(|v| v == "1")
+            .unwrap_or(false),
         // Hierarchical B-pyramid off by default, on two independent measurements (2026-09-06).
         //
         // Rate: at matched VMAF the pyramid costs *more* than P-only coding on every camera
@@ -1357,6 +1518,29 @@ pub fn quality_preset(q: u32) -> CodecConfig {
         cfg.subband_weights = SubbandWeights::uniform(0);
         cfg.adaptive_quantization = false;
         cfg.cfl_enabled = false;
+        // BUG-48: PAD-1's decay fill is a *wavelet* lever and it reverses sign under MED.
+        //
+        // `0039` fades the padding flat so its detail subbands go to zero, worth −4.63% RGB on
+        // four stills at q=80..94. MED has no subbands: it predicts each pixel from its left and
+        // upper neighbours, so a fade is something the residual has to *code* across, where plain
+        // edge replication predicts exactly. Same four stills, same binary, both arms via
+        // `GNC_PAD_FILL`, at q=100:
+        //
+        //   |                  | decay (was shipped) | replicate |         |
+        //   |------------------|--------------------:|----------:|--------:|
+        //   | bbb_1080p        |           3 257 157 | 3 235 737 | −0.657% |
+        //   | blue_sky_1080p   |           2 166 911 | 2 153 118 | −0.637% |
+        //   | kristensara_720p |             931 263 |   927 600 | −0.393% |
+        //   | touchdown_1080p  |           2 627 186 | 2 610 478 | −0.636% |
+        //
+        // **It belongs here and not on `q == 100`**, which is where the item filing put it: with
+        // `GNC_MED=0` the same q=100 is a lossless *wavelet* encode, and there decay is worth
+        // **−4.64%** on the same four stills — PAD-1's figure, reproduced at the top of the
+        // ladder. Keying this on the quality would have handed that arm a 4.6% regression.
+        //
+        // Pixels are untouched either way: the fill writes padding outside the visible area, and
+        // `pad_fill_mode` notes it is an encoder-side choice with no bitstream implication.
+        cfg.pad_fill_decay = false;
         eprintln!("GNC: MED prediction path active (LOSSLESS-1) — wavelet bypassed");
     }
     // A lossless preset must not carry a quantiser weight above 1.0 (BUG-15). q=100 reaches this
@@ -1595,7 +1779,9 @@ pub fn inter_dead_zone_mul() -> f32 {
 /// 50 fps — before any coding runs (MEAS-6, `docs/decisions/0033`). It *wins* 34–39% on animation,
 /// so it is kept as an opt-in rather than deleted.
 pub fn b_pyramid_enabled() -> bool {
-    std::env::var("GNC_B_PYRAMID").map(|v| v == "1").unwrap_or(false)
+    std::env::var("GNC_B_PYRAMID")
+        .map(|v| v == "1")
+        .unwrap_or(false)
 }
 
 /// GNC's shipped configuration at an explicit `qstep`, for callers that do not select a quality
@@ -1851,8 +2037,13 @@ impl GpuContext {
     /// Fallible version of `new_async()`. Returns an error string if GPU is unavailable.
     pub async fn try_new_async() -> Result<Self, String> {
         let backends = env_backends()?;
+        // `backend_options` from the environment so `WGPU_DX12_COMPILER=dxc` selects DXC over
+        // the default FXC (BUG-52: FXC stalls for minutes compiling GNC's compute shaders; DXC
+        // compiles them in seconds, matching naga-SPIR-V and Metal). Unset, this is FXC — the
+        // default is unchanged, and DXC also needs `dxcompiler.dll` + `dxil.dll` beside the exe.
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends,
+            backend_options: wgpu::BackendOptions::from_env_or_default(),
             ..Default::default()
         });
 
@@ -2228,12 +2419,16 @@ pub mod wasm {
 
                 // Check for an I-frame at this exact PTS (scene-cut or tail I-frame).
                 // Extract offset/size as copies so the borrow ends before mutable ops.
-                let iframe_offsets: Option<(usize, usize)> = th.index.iter()
+                let iframe_offsets: Option<(usize, usize)> = th
+                    .index
+                    .iter()
                     .find(|e| e.frame_role == 2 && e.pts == current_pts)
                     .map(|e| (e.offset as usize, e.offset as usize + e.size as usize));
 
                 let gop_idx = self.current_frame / gop_size;
-                let max_gop_idx = th.index.iter()
+                let max_gop_idx = th
+                    .index
+                    .iter()
                     .filter(|e| e.frame_role != 2)
                     .map(|e| e.gop_index as usize)
                     .max()
@@ -2247,12 +2442,16 @@ pub mod wasm {
                 }
 
                 if gop_idx <= max_gop_idx {
-                    let group = crate::format::deserialize_temporal_group(
-                        &self.data, th, gop_idx,
-                    );
-                    let frames = self.decoder.decode_temporal_group_rgba_wasm(
-                        &self.ctx, &group, th.temporal_transform, gop_size,
-                    ).await;
+                    let group = crate::format::deserialize_temporal_group(&self.data, th, gop_idx);
+                    let frames = self
+                        .decoder
+                        .decode_temporal_group_rgba_wasm(
+                            &self.ctx,
+                            &group,
+                            th.temporal_transform,
+                            gop_size,
+                        )
+                        .await;
 
                     let base = gop_idx * gop_size;
                     for (i, rgba) in frames.into_iter().enumerate() {
@@ -2265,7 +2464,9 @@ pub mod wasm {
                     // Past end of all frames — wrap to start.
                     self.current_frame = 0;
                     self.buffered_frames.clear();
-                    return Err(JsValue::from_str("End of GNV2 sequence, rewound to frame 0"));
+                    return Err(JsValue::from_str(
+                        "End of GNV2 sequence, rewound to frame 0",
+                    ));
                 }
             }
 
@@ -2287,29 +2488,26 @@ pub mod wasm {
                 // first, then decode the B-frame group.
                 let b_start = idx;
                 let mut b_end = idx;
-                while b_end < self.frame_count as usize
-                    && header.index[b_end].frame_type == 2
-                {
+                while b_end < self.frame_count as usize && header.index[b_end].frame_type == 2 {
                     b_end += 1;
                 }
 
                 if b_end < self.frame_count as usize {
                     // Save past ref, decode future anchor P, swap for B-frames
                     self.decoder.swap_forward_to_backward_ref(&self.ctx);
-                    let anchor_frame = crate::format::deserialize_sequence_frame(
-                        &self.data, header, b_end,
-                    );
-                    let anchor_rgba =
-                        self.decoder.decode_rgba_wasm(&self.ctx, &anchor_frame).await;
+                    let anchor_frame =
+                        crate::format::deserialize_sequence_frame(&self.data, header, b_end);
+                    let anchor_rgba = self
+                        .decoder
+                        .decode_rgba_wasm(&self.ctx, &anchor_frame)
+                        .await;
                     self.decoder.swap_references(); // ref=past, bwd=future
 
                     // Decode all B-frames in this group
                     for b_idx in b_start..b_end {
-                        let b_frame = crate::format::deserialize_sequence_frame(
-                            &self.data, header, b_idx,
-                        );
-                        let b_rgba =
-                            self.decoder.decode_rgba_wasm(&self.ctx, &b_frame).await;
+                        let b_frame =
+                            crate::format::deserialize_sequence_frame(&self.data, header, b_idx);
+                        let b_rgba = self.decoder.decode_rgba_wasm(&self.ctx, &b_frame).await;
                         self.buffered_frames.insert(b_idx, b_rgba);
                     }
 
@@ -2322,9 +2520,7 @@ pub mod wasm {
                     return Ok(rgba);
                 } else {
                     // No anchor available (end of sequence), fallback
-                    let frame = crate::format::deserialize_sequence_frame(
-                        &self.data, header, idx,
-                    );
+                    let frame = crate::format::deserialize_sequence_frame(&self.data, header, idx);
                     let rgba = self.decoder.decode_rgba_wasm(&self.ctx, &frame).await;
                     self.current_frame += 1;
                     return Ok(rgba);
@@ -2333,9 +2529,7 @@ pub mod wasm {
 
             // I/P frame: just decode it. If B-frames follow, they'll be
             // handled when current_frame advances to them.
-            let frame = crate::format::deserialize_sequence_frame(
-                &self.data, header, idx,
-            );
+            let frame = crate::format::deserialize_sequence_frame(&self.data, header, idx);
             let rgba = self.decoder.decode_rgba_wasm(&self.ctx, &frame).await;
             self.current_frame += 1;
             Ok(rgba)
@@ -2411,10 +2605,7 @@ pub mod wasm {
         /// Configure zero-copy rendering to a canvas element.
         /// After this, use `decode_and_present()` instead of `decode_next_frame()`.
         /// The canvas must NOT have a 2D context — WebGPU and 2D contexts are mutually exclusive.
-        pub fn set_canvas(
-            &mut self,
-            canvas: web_sys::HtmlCanvasElement,
-        ) -> Result<(), JsValue> {
+        pub fn set_canvas(&mut self, canvas: web_sys::HtmlCanvasElement) -> Result<(), JsValue> {
             let surface = self
                 .ctx
                 .instance
@@ -2423,58 +2614,50 @@ pub mod wasm {
 
             let config = surface
                 .get_default_config(&self.ctx.adapter, self.width, self.height)
-                .ok_or_else(|| {
-                    JsValue::from_str("Surface format not compatible with adapter")
-                })?;
+                .ok_or_else(|| JsValue::from_str("Surface format not compatible with adapter"))?;
             surface.configure(&self.ctx.device, &config);
 
-            let shader =
-                self.ctx
-                    .device
-                    .create_shader_module(wgpu::ShaderModuleDescriptor {
-                        label: Some("blit"),
-                        source: wgpu::ShaderSource::Wgsl(
-                            include_str!("shaders/blit.wgsl").into(),
-                        ),
-                    });
+            let shader = self
+                .ctx
+                .device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("blit"),
+                    source: wgpu::ShaderSource::Wgsl(include_str!("shaders/blit.wgsl").into()),
+                });
 
-            let bgl =
-                self.ctx
-                    .device
-                    .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                        label: Some("blit_bgl"),
-                        entries: &[
-                            wgpu::BindGroupLayoutEntry {
-                                binding: 0,
-                                visibility: wgpu::ShaderStages::FRAGMENT,
-                                ty: wgpu::BindingType::Texture {
-                                    sample_type: wgpu::TextureSampleType::Float {
-                                        filterable: true,
-                                    },
-                                    view_dimension: wgpu::TextureViewDimension::D2,
-                                    multisampled: false,
-                                },
-                                count: None,
+            let bgl = self
+                .ctx
+                .device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("blit_bgl"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
                             },
-                            wgpu::BindGroupLayoutEntry {
-                                binding: 1,
-                                visibility: wgpu::ShaderStages::FRAGMENT,
-                                ty: wgpu::BindingType::Sampler(
-                                    wgpu::SamplerBindingType::Filtering,
-                                ),
-                                count: None,
-                            },
-                        ],
-                    });
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
+                    ],
+                });
 
-            let pl =
-                self.ctx
-                    .device
-                    .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                        label: Some("blit_pl"),
-                        bind_group_layouts: &[&bgl],
-                        push_constant_ranges: &[],
-                    });
+            let pl = self
+                .ctx
+                .device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("blit_pl"),
+                    bind_group_layouts: &[&bgl],
+                    push_constant_ranges: &[],
+                });
 
             let pipeline =
                 self.ctx
@@ -2538,8 +2721,7 @@ pub mod wasm {
             if let Some(texture) = self.buffered_textures.remove(&self.current_frame) {
                 self.last_seek_ms = 0.0;
                 let t_dec = Self::now_ms();
-                let view =
-                    texture.create_view(&wgpu::TextureViewDescriptor::default());
+                let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
                 blit_to_surface(
                     &self.ctx.device,
                     &self.ctx.queue,
@@ -2564,19 +2746,25 @@ pub mod wasm {
 
                 // Check for an I-frame at this exact PTS (scene-cut or tail I-frame).
                 // Extract offset/size as copies so the borrow ends before mutable ops.
-                let iframe_offsets: Option<(usize, usize)> = th.index.iter()
+                let iframe_offsets: Option<(usize, usize)> = th
+                    .index
+                    .iter()
                     .find(|e| e.frame_role == 2 && e.pts == current_pts)
                     .map(|e| (e.offset as usize, e.offset as usize + e.size as usize));
 
                 let gop_idx = self.current_frame / gop_size;
-                let max_gop_idx = th.index.iter()
+                let max_gop_idx = th
+                    .index
+                    .iter()
                     .filter(|e| e.frame_role != 2)
                     .map(|e| e.gop_index as usize)
                     .max()
                     .unwrap_or(0);
                 // Pre-extract index entries as owned tuples so the th borrow can end before
                 // the mutable self.ensure_tw_bufs() call; used for prefetch computation.
-                let index_entries: Vec<(u8, u32, u16)> = th.index.iter()
+                let index_entries: Vec<(u8, u32, u16)> = th
+                    .index
+                    .iter()
                     .map(|e| (e.frame_role, e.pts, e.gop_index))
                     .collect();
 
@@ -2615,9 +2803,8 @@ pub mod wasm {
                             self.last_seek_ms = 0.0;
                         } else {
                             let t_seek = Self::now_ms();
-                            let group = crate::format::deserialize_temporal_group(
-                                &self.data, th, gop_idx,
-                            );
+                            let group =
+                                crate::format::deserialize_temporal_group(&self.data, th, gop_idx);
                             let padded_w = group.low_frame.info.padded_width();
                             let padded_h = group.low_frame.info.padded_height();
                             let gop_info = group.low_frame.info;
@@ -2627,8 +2814,12 @@ pub mod wasm {
                             self.tw_gop_config = Some(gop_config);
                             let set = &self.tw_buf_sets[self.tw_active];
                             self.decoder.decode_temporal_gop_into(
-                                &self.ctx, &group, temporal_transform, gop_size,
-                                &set.frame_bufs, &set.snapshot_bufs,
+                                &self.ctx,
+                                &group,
+                                temporal_transform,
+                                gop_size,
+                                &set.frame_bufs,
+                                &set.snapshot_bufs,
                             );
                             self.tw_gop_base = gop_base;
                             self.tw_prefetch_base = usize::MAX;
@@ -2667,11 +2858,11 @@ pub mod wasm {
                         && self.tw_prefetch_base != gop_base + gop_size
                     {
                         let next_gop_base = (gop_idx + 1) * gop_size;
-                        index_entries.iter()
+                        index_entries
+                            .iter()
                             .filter(|(role, pts, _)| *role == 0 && *pts >= next_gop_base as u32)
                             .map(|(_, _, gop_index)| *gop_index as usize)
                             .min()
-
                     } else {
                         None
                     };
@@ -2720,30 +2911,23 @@ pub mod wasm {
                 let t_seek = Self::now_ms();
                 let b_start = idx;
                 let mut b_end = idx;
-                while b_end < self.frame_count as usize
-                    && header.index[b_end].frame_type == 2
-                {
+                while b_end < self.frame_count as usize && header.index[b_end].frame_type == 2 {
                     b_end += 1;
                 }
 
                 if b_end < self.frame_count as usize {
                     self.decoder.swap_forward_to_backward_ref(&self.ctx);
-                    let anchor_frame = crate::format::deserialize_sequence_frame(
-                        &self.data, header, b_end,
-                    );
-                    let (anchor_tex, _) = self.decoder.decode_to_owned_texture(
-                        &self.ctx,
-                        &anchor_frame,
-                    );
+                    let anchor_frame =
+                        crate::format::deserialize_sequence_frame(&self.data, header, b_end);
+                    let (anchor_tex, _) = self
+                        .decoder
+                        .decode_to_owned_texture(&self.ctx, &anchor_frame);
                     self.decoder.swap_references();
 
                     for b_idx in b_start..b_end {
-                        let b_frame = crate::format::deserialize_sequence_frame(
-                            &self.data, header, b_idx,
-                        );
-                        let (b_tex, _) = self.decoder.decode_to_owned_texture(
-                            &self.ctx, &b_frame,
-                        );
+                        let b_frame =
+                            crate::format::deserialize_sequence_frame(&self.data, header, b_idx);
+                        let (b_tex, _) = self.decoder.decode_to_owned_texture(&self.ctx, &b_frame);
                         self.buffered_textures.insert(b_idx, b_tex);
                     }
 
@@ -2752,10 +2936,8 @@ pub mod wasm {
                     self.last_seek_ms = Self::now_ms() - t_seek;
 
                     let t_dec = Self::now_ms();
-                    let texture =
-                        self.buffered_textures.remove(&idx).unwrap();
-                    let view = texture
-                        .create_view(&wgpu::TextureViewDescriptor::default());
+                    let texture = self.buffered_textures.remove(&idx).unwrap();
+                    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
                     blit_to_surface(
                         &self.ctx.device,
                         &self.ctx.queue,
@@ -2772,9 +2954,7 @@ pub mod wasm {
                     // No anchor available — decode as-is
                     self.last_seek_ms = 0.0;
                     let t_dec = Self::now_ms();
-                    let frame = crate::format::deserialize_sequence_frame(
-                        &self.data, header, idx,
-                    );
+                    let frame = crate::format::deserialize_sequence_frame(&self.data, header, idx);
                     self.decoder.decode_to_texture(&self.ctx, &frame);
                     let view = self.decoder.output_texture_view().unwrap();
                     blit_to_surface(
@@ -2795,8 +2975,7 @@ pub mod wasm {
             // I/P frame: decode to cached texture and present
             self.last_seek_ms = 0.0;
             let t_dec = Self::now_ms();
-            let frame =
-                crate::format::deserialize_sequence_frame(&self.data, header, idx);
+            let frame = crate::format::deserialize_sequence_frame(&self.data, header, idx);
             self.decoder.decode_to_texture(&self.ctx, &frame);
             let view = self.decoder.output_texture_view().unwrap();
             blit_to_surface(
@@ -2873,9 +3052,7 @@ pub mod wasm {
                     // Phase 1: decode GOP wavelet bufs
                     let t_seek = Self::now_ms();
                     let th = self.temporal_header.as_ref().unwrap();
-                    let group = crate::format::deserialize_temporal_group(
-                        &self.data, th, gop_idx,
-                    );
+                    let group = crate::format::deserialize_temporal_group(&self.data, th, gop_idx);
                     self.tw_gop_info = Some(group.low_frame.info);
                     self.tw_gop_config = Some(group.low_frame.config.clone());
                     let padded_w = group.low_frame.info.padded_width();
@@ -2883,8 +3060,12 @@ pub mod wasm {
                     self.ensure_tw_bufs(padded_w, padded_h, gop_size);
                     let set = &self.tw_buf_sets[self.tw_active];
                     self.decoder.decode_temporal_gop_into(
-                        &self.ctx, &group, temporal_transform, gop_size,
-                        &set.frame_bufs, &set.snapshot_bufs,
+                        &self.ctx,
+                        &group,
+                        temporal_transform,
+                        gop_size,
+                        &set.frame_bufs,
+                        &set.snapshot_bufs,
                     );
                     self.tw_gop_base = gop_base;
                     self.tw_prefetch_base = usize::MAX;
@@ -2951,8 +3132,7 @@ pub mod wasm {
                 return self.decode_and_present();
             }
 
-            let target =
-                (target_frame as usize).min(self.frame_count as usize - 1);
+            let target = (target_frame as usize).min(self.frame_count as usize - 1);
             let keyframe_idx = {
                 let header = self.header.as_ref().unwrap();
                 crate::format::seek_to_keyframe(header, target as u64)
@@ -2964,9 +3144,7 @@ pub mod wasm {
 
             // Decode forward from keyframe, discarding intermediate frames
             let t_seek = Self::now_ms();
-            while self.current_frame < target
-                && !self.buffered_textures.contains_key(&target)
-            {
+            while self.current_frame < target && !self.buffered_textures.contains_key(&target) {
                 self.gpu_advance_one();
             }
             self.last_seek_ms = Self::now_ms() - t_seek;
@@ -2974,8 +3152,7 @@ pub mod wasm {
             // Present the target
             let t_dec = Self::now_ms();
             if let Some(texture) = self.buffered_textures.remove(&target) {
-                let view =
-                    texture.create_view(&wgpu::TextureViewDescriptor::default());
+                let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
                 blit_to_surface(
                     &self.ctx.device,
                     &self.ctx.queue,
@@ -3048,16 +3225,18 @@ pub mod wasm {
         /// Prefetch a GOP into the inactive buffer set.
         fn prefetch_next_gop(&mut self, gop_idx: usize, gop_size: usize) {
             let th = self.temporal_header.as_ref().unwrap();
-            let group = crate::format::deserialize_temporal_group(
-                &self.data, th, gop_idx,
-            );
+            let group = crate::format::deserialize_temporal_group(&self.data, th, gop_idx);
             self.tw_gop_info = Some(group.low_frame.info);
             self.tw_gop_config = Some(group.low_frame.config.clone());
             let prefetch_set = 1 - self.tw_active;
             let set = &self.tw_buf_sets[prefetch_set];
             self.decoder.decode_temporal_gop_into(
-                &self.ctx, &group, th.temporal_transform, gop_size,
-                &set.frame_bufs, &set.snapshot_bufs,
+                &self.ctx,
+                &group,
+                th.temporal_transform,
+                gop_size,
+                &set.frame_bufs,
+                &set.snapshot_bufs,
             );
             self.tw_prefetch_base = gop_idx * gop_size;
         }
@@ -3085,28 +3264,21 @@ pub mod wasm {
             if ft == 2 {
                 let b_start = idx;
                 let mut b_end = idx;
-                while b_end < self.frame_count as usize
-                    && header.index[b_end].frame_type == 2
-                {
+                while b_end < self.frame_count as usize && header.index[b_end].frame_type == 2 {
                     b_end += 1;
                 }
 
                 if b_end < self.frame_count as usize {
                     self.decoder.swap_forward_to_backward_ref(&self.ctx);
-                    let anchor = crate::format::deserialize_sequence_frame(
-                        &self.data, header, b_end,
-                    );
-                    let (anchor_tex, _) =
-                        self.decoder.decode_to_owned_texture(&self.ctx, &anchor);
+                    let anchor =
+                        crate::format::deserialize_sequence_frame(&self.data, header, b_end);
+                    let (anchor_tex, _) = self.decoder.decode_to_owned_texture(&self.ctx, &anchor);
                     self.decoder.swap_references();
 
                     for b_idx in b_start..b_end {
-                        let b_frame = crate::format::deserialize_sequence_frame(
-                            &self.data, header, b_idx,
-                        );
-                        let (b_tex, _) = self
-                            .decoder
-                            .decode_to_owned_texture(&self.ctx, &b_frame);
+                        let b_frame =
+                            crate::format::deserialize_sequence_frame(&self.data, header, b_idx);
+                        let (b_tex, _) = self.decoder.decode_to_owned_texture(&self.ctx, &b_frame);
                         self.buffered_textures.insert(b_idx, b_tex);
                     }
 
@@ -3117,16 +3289,12 @@ pub mod wasm {
                     self.buffered_textures.remove(&idx);
                     self.current_frame = idx + 1;
                 } else {
-                    let frame = crate::format::deserialize_sequence_frame(
-                        &self.data, header, idx,
-                    );
+                    let frame = crate::format::deserialize_sequence_frame(&self.data, header, idx);
                     self.decoder.decode_to_texture(&self.ctx, &frame);
                     self.current_frame += 1;
                 }
             } else {
-                let frame = crate::format::deserialize_sequence_frame(
-                    &self.data, header, idx,
-                );
+                let frame = crate::format::deserialize_sequence_frame(&self.data, header, idx);
                 self.decoder.decode_to_texture(&self.ctx, &frame);
                 self.current_frame += 1;
             }

@@ -424,13 +424,18 @@ impl CachedEncodeBuffers {
             input_buf: ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("enc_input"),
                 size: buf_size_3,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                // COPY_SRC since LOSSLESS-5: a Y'CbCr-native frame has no colour transform to run,
+                // so the padded interleaved planes are copied straight into `color_out`.
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             }),
             color_out: ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("enc_color_out"),
                 size: buf_size_3,
-                usage: wgpu::BufferUsages::STORAGE,
+                // COPY_DST since LOSSLESS-5: destination of that same copy.
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
 
@@ -879,14 +884,7 @@ impl CachedEncodeBuffers {
             me_params_pyr_nopred: {
                 let pyr_w = padded_w / 4;
                 let pyr_h = padded_h / 4;
-                Self::make_block_match_params(
-                    ctx,
-                    pyr_w,
-                    pyr_h,
-                    ME_PYRAMID_SEARCH_RANGE,
-                    false,
-                    0,
-                )
+                Self::make_block_match_params(ctx, pyr_w, pyr_h, ME_PYRAMID_SEARCH_RANGE, false, 0)
             },
             me_params_pyramid_pred: Self::make_block_match_params(
                 ctx,
@@ -990,8 +988,14 @@ impl CachedEncodeBuffers {
         pred_fine_range: u32,
     ) -> wgpu::Buffer {
         Self::make_bidir_params_full(
-            ctx, padded_w, padded_h, search_range,
-            use_fwd_predictor, use_bwd_predictor, pred_fine_range, false,
+            ctx,
+            padded_w,
+            padded_h,
+            search_range,
+            use_fwd_predictor,
+            use_bwd_predictor,
+            pred_fine_range,
+            false,
         )
     }
 
@@ -1015,11 +1019,11 @@ impl CachedEncodeBuffers {
             search_range: u32,
             blocks_x: u32,
             total_blocks: u32,
-            use_predictor: u32,      // legacy: 1 = both fwd+bwd
+            use_predictor: u32, // legacy: 1 = both fwd+bwd
             pred_fine_range: u32,
             use_fwd_predictor: u32,
             use_bwd_predictor: u32,
-            skip_qpel: u32,          // 1 = skip Phase 3c+3d
+            skip_qpel: u32, // 1 = skip Phase 3c+3d
             _pad1: u32,
         }
         let blocks_x = padded_w / ME_BLOCK_SIZE;
@@ -1150,8 +1154,7 @@ impl CachedEncodeBuffers {
         if self.fused_hist_bufs.is_some() {
             return;
         }
-        let hist_size =
-            (num_tiles as u64) * super::rans_gpu_encode::HIST_TILE_STRIDE as u64 * 4;
+        let hist_size = (num_tiles as u64) * super::rans_gpu_encode::HIST_TILE_STRIDE as u64 * 4;
         let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC;
         self.fused_hist_bufs = Some(std::array::from_fn(|i| {
             ctx.device.create_buffer(&wgpu::BufferDescriptor {

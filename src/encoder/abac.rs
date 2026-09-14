@@ -116,7 +116,11 @@ struct BitWriter {
 
 impl BitWriter {
     fn new() -> Self {
-        Self { bytes: Vec::new(), cur: 0, nbits: 0 }
+        Self {
+            bytes: Vec::new(),
+            cur: 0,
+            nbits: 0,
+        }
     }
 
     fn put(&mut self, bit: bool) {
@@ -145,7 +149,11 @@ struct BitReader<'a> {
 
 impl<'a> BitReader<'a> {
     fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, pos: 0, nbits: 0 }
+        Self {
+            bytes,
+            pos: 0,
+            nbits: 0,
+        }
     }
 
     /// Past the end reads as zero, so a truncated stream terminates instead of panicking —
@@ -174,7 +182,12 @@ struct Encoder {
 
 impl Encoder {
     fn new() -> Self {
-        Self { low: 0, high: STATE_MASK, pending: 0, out: BitWriter::new() }
+        Self {
+            low: 0,
+            high: STATE_MASK,
+            pending: 0,
+            out: BitWriter::new(),
+        }
     }
 
     fn emit(&mut self, bit: bool) {
@@ -269,7 +282,12 @@ impl<'a> Decoder<'a> {
         for _ in 0..STATE_BITS {
             code = (code << 1) | u32::from(input.get());
         }
-        Self { low: 0, high: STATE_MASK, code, input }
+        Self {
+            low: 0,
+            high: STATE_MASK,
+            code,
+            input,
+        }
     }
 
     fn renormalise(&mut self) {
@@ -495,7 +513,13 @@ struct RangeEncoder {
 
 impl RangeEncoder {
     fn new() -> Self {
-        Self { low: 0, range: u32::MAX, cache: 0, cache_size: 1, out: Vec::new() }
+        Self {
+            low: 0,
+            range: u32::MAX,
+            cache: 0,
+            cache_size: 1,
+            out: Vec::new(),
+        }
     }
 
     /// Emit the top byte of `low`, propagating a carry back through any pending 0xFF run.
@@ -569,7 +593,12 @@ impl<'a> RangeDecoder<'a> {
     }
 
     fn new(bytes: &'a [u8]) -> Self {
-        let mut d = Self { range: u32::MAX, code: 0, bytes, pos: 0 };
+        let mut d = Self {
+            range: u32::MAX,
+            code: 0,
+            bytes,
+            pos: 0,
+        };
         // The encoder's first `shift_low` emits the initial cache byte, which carries no
         // information; skip it and prime with the next four.
         d.next_byte();
@@ -748,7 +777,10 @@ mod tests {
         for coder in [Coder::Interval, Coder::Range] {
             let bytes = coder.encode_block(coefficients, width);
             let back = coder.decode_block(&bytes, coefficients.len(), width);
-            assert_eq!(back, coefficients, "{label} ({coder:?}): roundtrip must be exact");
+            assert_eq!(
+                back, coefficients,
+                "{label} ({coder:?}): roundtrip must be exact"
+            );
         }
     }
 
@@ -757,7 +789,11 @@ mod tests {
         roundtrip(&vec![0i32; 64 * 64], 64, "all zero");
         roundtrip(&vec![1i32; 64 * 64], 64, "all one");
         roundtrip(&vec![-1i32; 64 * 64], 64, "all minus one");
-        roundtrip(&(0..64 * 64).map(|i| (i % 7) - 3).collect::<Vec<_>>(), 64, "small cycle");
+        roundtrip(
+            &(0..64 * 64).map(|i| (i % 7) - 3).collect::<Vec<_>>(),
+            64,
+            "small cycle",
+        );
         // Sparse with a large outlier: exercises the Exp-Golomb suffix and the significance path.
         let mut sparse = vec![0i32; 64 * 64];
         sparse[0] = 1;
@@ -765,7 +801,13 @@ mod tests {
         sparse[64 * 64 - 1] = 4095;
         roundtrip(&sparse, 64, "sparse with outliers");
         // Non-square blocks happen at subband edges.
-        roundtrip(&(0..64 * 17).map(|i| ((i * 31) % 11) - 5).collect::<Vec<_>>(), 17, "17 wide");
+        roundtrip(
+            &(0..64 * 17)
+                .map(|i| ((i * 31) % 11) - 5)
+                .collect::<Vec<_>>(),
+            17,
+            "17 wide",
+        );
         roundtrip(&(0..5i32).collect::<Vec<_>>(), 5, "single row");
     }
 

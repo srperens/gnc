@@ -42,7 +42,11 @@ fn no_fixed_temp_paths_outside_the_helper() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
     rust_sources(&src, &mut files);
-    assert!(!files.is_empty(), "found no Rust sources under {}", src.display());
+    assert!(
+        !files.is_empty(),
+        "found no Rust sources under {}",
+        src.display()
+    );
 
     // `session_temp_path` is the one legitimate caller: it is what everything else goes through.
     let helper = src.join("lib.rs");
@@ -95,7 +99,10 @@ fn session_temp_path_is_unique_per_process_and_keeps_the_extension() {
         stem.ends_with(&format!("_p{pid}")),
         "stem {stem} should end with _p{pid}"
     );
-    assert!(stem.starts_with("gnc_probe_ref"), "stem {stem} lost its name");
+    assert!(
+        stem.starts_with("gnc_probe_ref"),
+        "stem {stem} lost its name"
+    );
 
     // Distinct names still map to distinct paths.
     let b = gnc::session_temp_path("gnc_probe_dist.y4m");

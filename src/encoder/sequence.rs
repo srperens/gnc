@@ -45,7 +45,12 @@ struct FrameSource<F: FnMut(usize) -> Arc<Vec<f32>>> {
 
 impl<F: FnMut(usize) -> Arc<Vec<f32>>> FrameSource<F> {
     fn new(load: F) -> Self {
-        FrameSource { load, cache: Vec::with_capacity(FRAME_CACHE_SLOTS), requests: 0, loads: 0 }
+        FrameSource {
+            load,
+            cache: Vec::with_capacity(FRAME_CACHE_SLOTS),
+            requests: 0,
+            loads: 0,
+        }
     }
 
     /// Pixels for display index `i`, from the cache when they are already here.
@@ -173,6 +178,59 @@ impl EncoderPipeline {
     ///
     /// When `config.target_bitrate` is set, a rate controller adjusts the
     /// quantization step per frame to hit the target bitrate (CBR or VBR).
+    /// Pad-aligned RGB in, three planes out: the two dispatches that every encode path starts
+    /// with, in one place.
+    ///
+    /// **This existed eleven times.** They differed only in which buffer set they used, what the
+    /// command encoder was called, and where the planes landed — never in what they did. Eleven
+    /// copies is why an inconsistency between them could not be seen: `local_decode_ref_from_source`
+    /// passes `reversible = true` unconditionally where the others compute it, which is correct
+    /// (a bit-exact frame's reference is built from the source, so the transform must be the
+    /// reversible one) but was indistinguishable from a typo while it sat among ten near-identical
+    /// neighbours.
+    ///
+    /// It is also what LOSSLESS-5 needs: coding a Y4M source's own Y'CbCr planes means *not*
+    /// running these two dispatches, and that decision now has one site to be made at instead of
+    /// eleven.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn preprocess_to_planes(
+        &self,
+        ctx: &GpuContext,
+        cmd: &mut wgpu::CommandEncoder,
+        input_buf: &wgpu::Buffer,
+        color_out: &wgpu::Buffer,
+        out_y: &wgpu::Buffer,
+        out_co: &wgpu::Buffer,
+        out_cg: &wgpu::Buffer,
+        padded_w: u32,
+        padded_h: u32,
+        padded_pixels: u32,
+        reversible: bool,
+        convert_colour: bool,
+    ) {
+        // **LOSSLESS-5.** When the frame arrived as the source's own Y'CbCr there is nothing to
+        // convert: `color_out` is fed the interleaved planes directly and only the deinterleave
+        // has to run. Skipping the matrix is the whole of the colour-space saving — measured at
+        // **−13.2%** on four clips once the chroma-format change it used to be confused with was
+        // separated out (2026-09-11). The pad shader above is channel-agnostic, so nothing else
+        // on this path needs to know.
+        if convert_colour {
+            self.color.dispatch(
+                ctx, cmd, input_buf, color_out, padded_w, padded_h, true, reversible,
+            );
+        } else {
+            cmd.copy_buffer_to_buffer(
+                input_buf,
+                0,
+                color_out,
+                0,
+                (padded_pixels as u64) * 3 * std::mem::size_of::<f32>() as u64,
+            );
+        }
+        self.deinterleaver
+            .dispatch(ctx, cmd, color_out, out_y, out_co, out_cg, padded_pixels);
+    }
+
     pub fn encode_sequence(
         &mut self,
         ctx: &GpuContext,
@@ -296,20 +354,19 @@ impl EncoderPipeline {
         // makes every following P-frame encode far worse — the encoder produced a 32% larger
         // file with diagnostics on than off. Off by default until that is fixed; set
         // GNC_DIAG_TWAV=1 to opt in and accept the corruption. See RESEARCH_LOG 2026-09-06.
-        let diag_twav_staging: Option<[wgpu::Buffer; 3]> = if diag_enabled
-            && std::env::var("GNC_DIAG_TWAV").is_ok()
-        {
-            Some(std::array::from_fn(|i| {
-                ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some(["diag_twav_y", "diag_twav_co", "diag_twav_cg"][i]),
-                    size: (padded_pixels * std::mem::size_of::<f32>()) as u64,
-                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                })
-            }))
-        } else {
-            None
-        };
+        let diag_twav_staging: Option<[wgpu::Buffer; 3]> =
+            if diag_enabled && std::env::var("GNC_DIAG_TWAV").is_ok() {
+                Some(std::array::from_fn(|i| {
+                    ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some(["diag_twav_y", "diag_twav_co", "diag_twav_cg"][i]),
+                        size: (padded_pixels * std::mem::size_of::<f32>()) as u64,
+                        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    })
+                }))
+            } else {
+                None
+            };
         let mut prev_twav_coeffs: Option<[Vec<f32>; 3]> = None;
 
         // Look-ahead ME pipelining: pre-compute ME for the next P-frame while the
@@ -343,7 +400,8 @@ impl EncoderPipeline {
                     true
                 } else if let Some(ref prev_luma) = prev_frame_luma {
                     let frame_data_for_cut = frames.get(display_idx);
-                    let mad = crate::luma_proxy_mad(&crate::luma_proxy(&frame_data_for_cut), prev_luma);
+                    let mad =
+                        crate::luma_proxy_mad(&crate::luma_proxy(&frame_data_for_cut), prev_luma);
                     let is_cut = mad > config.scene_cut_threshold;
                     if is_cut && std::env::var("GNC_DEBUG").is_ok() {
                         eprintln!(
@@ -362,7 +420,8 @@ impl EncoderPipeline {
                 false
             };
 
-            let is_keyframe = ki <= 1 || display_idx % ki == 0 || !has_reference || scene_cut_forced;
+            let is_keyframe =
+                ki <= 1 || display_idx % ki == 0 || !has_reference || scene_cut_forced;
 
             // Build per-frame config: override qstep if rate control is active.
             // A quantiser *cascade* down the GOP (step growing with distance from the keyframe)
@@ -421,7 +480,6 @@ impl EncoderPipeline {
                 cfg
             };
 
-
             if is_keyframe {
                 let _t_iframe = std::time::Instant::now();
                 let frame_data = frames.get(display_idx);
@@ -464,8 +522,8 @@ impl EncoderPipeline {
                 }
                 has_reference = true;
                 pending_me = None; // discard look-ahead ME on keyframe boundary
-                // LOSSLESS-2 needs this outside `diag_enabled`: it is the estimate of what an
-                // I-frame of the *next* picture would cost, and the decision runs in every build.
+                                   // LOSSLESS-2 needs this outside `diag_enabled`: it is the estimate of what an
+                                   // I-frame of the *next* picture would cost, and the decision runs in every build.
                 last_iframe_bytes = Some(compressed.byte_size());
                 if diag_enabled {
                     let d = diagnostics::collect(
@@ -790,7 +848,8 @@ impl EncoderPipeline {
                 // CPU-side per-tile |P − ref| sum, report fraction of tiles preferring B₄.
                 // Gate passes if > 20% of tiles prefer B₄ (B₄ is closer in time = less residual).
                 if std::env::var_os("GNC_PYRAMID_REF").is_some() {
-                    static PYRAMID_REF_PRINTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    static PYRAMID_REF_PRINTED: std::sync::OnceLock<()> =
+                        std::sync::OnceLock::new();
                     PYRAMID_REF_PRINTED.get_or_init(|| {
                         eprintln!("[pyramid_ref] diagnostic active (GNC_PYRAMID_REF)");
                     });
@@ -842,10 +901,8 @@ impl EncoderPipeline {
                                             break;
                                         }
                                         let idx = (y * w + x) * ch_stride;
-                                        sad_i0 +=
-                                            (p_frame_data[idx] - i0_data[idx]).abs() as f64;
-                                        sad_b4 +=
-                                            (p_frame_data[idx] - b4_data[idx]).abs() as f64;
+                                        sad_i0 += (p_frame_data[idx] - i0_data[idx]).abs() as f64;
+                                        sad_b4 += (p_frame_data[idx] - b4_data[idx]).abs() as f64;
                                         cnt += 1;
                                     }
                                 }
@@ -861,8 +918,7 @@ impl EncoderPipeline {
 
                         if total_tiles > 0 {
                             let frac = b4_wins as f32 / total_tiles as f32;
-                            let mean_ratio =
-                                (total_sad_ratio / total_tiles as f64) as f32;
+                            let mean_ratio = (total_sad_ratio / total_tiles as f64) as f32;
                             eprintln!(
                                 "[pyramid_ref] P₈(frame {}) vs I₀(frame {}) / B₄_src(frame {}): {}/{} tiles prefer B₄ ({:.1}%) | mean_SAD_ratio={:.3} | gate: {}",
                                 p_display, i0_display, b4_display,
@@ -964,7 +1020,11 @@ impl EncoderPipeline {
                 // In pyramid mode: P₈ now references B₄ (gpu_ref_planes = decoded B₄).
                 // Precomputed ME from the previous group was against the old I₀ reference,
                 // so it cannot be reused here. Pass None to force fresh ME against B₄.
-                let p8_pending_me = if pyramid_enabled { None } else { pending_me.take() };
+                let p8_pending_me = if pyramid_enabled {
+                    None
+                } else {
+                    pending_me.take()
+                };
 
                 let (compressed, next_precomputed) = self.encode_pframe(
                     ctx,
@@ -1077,7 +1137,7 @@ impl EncoderPipeline {
                 if pyramid_enabled {
                     // Save P₈ permanently into slot 4 before any bwd manipulation
                     self.copy_bwd_ref_to_pyramid_slot(ctx, 4, plane_size); // P₈ → slot 4
-                    // Load I₀ from slot 3 for B₂'s forward reference
+                                                                           // Load I₀ from slot 3 for B₂'s forward reference
                     self.copy_pyramid_slot_to_fwd_ref(ctx, 3, plane_size); // I₀ → fwd
                     self.copy_pyramid_slot_to_bwd_ref(ctx, 0, plane_size); // B₄ → bwd
                 }
@@ -1124,13 +1184,20 @@ impl EncoderPipeline {
                             mf.bwd_ref_idx = Some(2);
                         }
                         self.local_decode_bframe_to_pyramid_slot(
-                            ctx, &info, &b_config, &fwd_mv, &bwd_mv,
-                            padded_w, padded_h, padded_pixels, 1,
+                            ctx,
+                            &info,
+                            &b_config,
+                            &fwd_mv,
+                            &bwd_mv,
+                            padded_w,
+                            padded_h,
+                            padded_pixels,
+                            1,
                         );
                         if std::env::var("GNC_BFRAME_PYRAMID").is_ok() {
                             eprintln!(
-                                "[pyramid_b] Frame {} (display) layer=2 fwd_ref=0 bwd_ref=2",
-                                b2_display
+                                "[pyramid_b] Frame {} (display) layer=2 fwd_ref=0 bwd_ref=2 qstep={:.2} (l2_scale={:.2}x)",
+                                b2_display, b_config.quantization_step, l2_qp_scale
                             );
                         }
                     }
@@ -1195,13 +1262,20 @@ impl EncoderPipeline {
                             mf.bwd_ref_idx = Some(1);
                         }
                         self.local_decode_bframe_to_pyramid_slot(
-                            ctx, &info, &b_config, &fwd_mv, &bwd_mv,
-                            padded_w, padded_h, padded_pixels, 2,
+                            ctx,
+                            &info,
+                            &b_config,
+                            &fwd_mv,
+                            &bwd_mv,
+                            padded_w,
+                            padded_h,
+                            padded_pixels,
+                            2,
                         );
                         if std::env::var("GNC_BFRAME_PYRAMID").is_ok() {
                             eprintln!(
-                                "[pyramid_b] Frame {} (display) layer=2 fwd_ref=2 bwd_ref=1",
-                                b6_display
+                                "[pyramid_b] Frame {} (display) layer=2 fwd_ref=2 bwd_ref=1 qstep={:.2} (l2_scale={:.2}x)",
+                                b6_display, b_config.quantization_step, l2_qp_scale
                             );
                         }
                     }
@@ -1229,10 +1303,10 @@ impl EncoderPipeline {
                 //
                 // Layer 3 B-frames encoding
                 let layer3_order = [
-                    (group_start, 0u8, 3u8),     // B₁: fwd=0(past_anchor/slot3), bwd=3(B₂/slot1)
-                    (group_start + 2, 3, 2),      // B₃: fwd=3(B₂/slot1), bwd=2(B₄/slot0)
-                    (group_start + 4, 2, 4),      // B₅: fwd=2(B₄/slot0), bwd=4(B₆/slot2)
-                    (group_start + 6, 4, 1),      // B₇: fwd=4(B₆/slot2), bwd=1(future_P/bwd buf)
+                    (group_start, 0u8, 3u8), // B₁: fwd=0(past_anchor/slot3), bwd=3(B₂/slot1)
+                    (group_start + 2, 3, 2), // B₃: fwd=3(B₂/slot1), bwd=2(B₄/slot0)
+                    (group_start + 4, 2, 4), // B₅: fwd=2(B₄/slot0), bwd=4(B₆/slot2)
+                    (group_start + 6, 4, 1), // B₇: fwd=4(B₆/slot2), bwd=1(future_P/bwd buf)
                 ];
 
                 for (b_display, fwd_idx, bwd_idx) in layer3_order {
@@ -1258,15 +1332,49 @@ impl EncoderPipeline {
                             _ => {}
                         }
                     }
-                    // Layer-3 B-frames are leaf nodes (never used as references).
-                    // Apply QP scale to reduce their size; decoder reads qstep from frame header.
-                    // Layer-3 leaf B-frames (B₁,B₃,B₅,B₇) are never used as references.
-                    // Default 1.5× matches H.264 QP+4 practice for inner B-frames.
-                    // Disable with GNC_PYRAMID_L3_QP_SCALE=1.0.
+                    // Layer-3 leaf B-frames (B₁,B₃,B₅,B₇) are never used as references, so a
+                    // coarser quantiser for them propagates nowhere — which is why H.264 runs
+                    // inner B-frames at about QP+4 and why 1.5x was the shipped default here.
+                    //
+                    // MEAS-2 measured it, and the right value depends on the operating point
+                    // (`docs/decisions/0061`). Below the fine end the leaf's error is dominated
+                    // by prediction, so coarsening it is nearly free: over q=30-75, 1.5x is the
+                    // best of 1.0/1.5/2.0 on **both** VMAF (−12.1% BD-rate against the pyramid
+                    // off, where 1.0x reaches only −3.9%) and worst-frame PSNR (+1.8% against
+                    // +10.0%). At contribution quality the leaf's error is set by its own
+                    // quantiser instead, so the same 1.5x is a pure move along the RD curve: on
+                    // crowd_run at q=85 it saves 5.7% of the bytes for 2.83 dB of worst-frame
+                    // PSNR, and 1.0x is the only setting that beats the pyramid being off on
+                    // both metrics at once.
+                    //
+                    // Keyed on the quantiser step for the reasons `p_qp_scale` is (see below):
+                    // the step is the physically relevant quantity, and `q` is not available
+                    // here at all under `--qstep` or rate control. The breakpoints are the
+                    // measured ones — 4.0 is q=75 and 2.8 is q=85 — and the ramp between them is
+                    // interpolation, since nothing was measured in that gap. The step read is
+                    // the one actually being scaled, so rate control keys on its own estimate
+                    // rather than on the config the sequence started with.
+                    const L3_SCALE_COARSE_STEP: f32 = 4.0;
+                    const L3_SCALE_FINE_STEP: f32 = 2.8;
+                    let leaf_step = rate_ctrl
+                        .as_ref()
+                        .map(|rc| rc.estimate_qstep())
+                        .unwrap_or(config.quantization_step);
+                    let l3_default: f32 = if leaf_step >= L3_SCALE_COARSE_STEP {
+                        1.5
+                    } else if leaf_step <= L3_SCALE_FINE_STEP {
+                        1.0
+                    } else {
+                        1.0 + 0.5 * (leaf_step - L3_SCALE_FINE_STEP)
+                            / (L3_SCALE_COARSE_STEP - L3_SCALE_FINE_STEP)
+                    };
+                    // GNC_PYRAMID_L3_QP_SCALE overrides the taper, and the canary below says
+                    // which of the two the encoder read — "the knob did nothing" and "the knob
+                    // was never read" must not be confusable (INTER-1's rule for `p_qp_scale`).
                     let l3_qp_scale: f32 = std::env::var("GNC_PYRAMID_L3_QP_SCALE")
                         .ok()
                         .and_then(|s| s.parse().ok())
-                        .unwrap_or(1.5_f32);
+                        .unwrap_or(l3_default);
                     let b_config = {
                         let mut cfg = if let Some(ref rc) = rate_ctrl {
                             let mut c = config.clone();
@@ -1301,8 +1409,18 @@ impl EncoderPipeline {
                         }
                         if std::env::var("GNC_BFRAME_PYRAMID").is_ok() {
                             eprintln!(
-                                "[pyramid_b] Frame {} (display) layer=3 fwd_ref={} bwd_ref={} qstep={:.2} (l3_scale={:.2}x)",
-                                b_display, fwd_idx, bwd_idx, b_config.quantization_step, l3_qp_scale
+                                "[pyramid_b] Frame {} (display) layer=3 fwd_ref={} bwd_ref={} qstep={:.2} ({}, l3_scale={:.2}x, taper default {:.2})",
+                                b_display,
+                                fwd_idx,
+                                bwd_idx,
+                                b_config.quantization_step,
+                                if std::env::var_os("GNC_PYRAMID_L3_QP_SCALE").is_some() {
+                                    "env"
+                                } else {
+                                    "taper"
+                                },
+                                l3_qp_scale,
+                                l3_default
                             );
                         }
                     }
@@ -1503,13 +1621,14 @@ impl EncoderPipeline {
         // Refused when a bitrate target is set: choosing lossless would blow it silently.
         // `GNC_LOSSLESS_SEQUENCE_FALLBACK=0` turns it off, which is the measurement arm.
         //
-        // **4:4:4 only, deliberately, until BUG-46 is fixed.** The trigger reads a size that
-        // `encode` measured for RATE-2, and `lossless_sibling` builds its candidate from
-        // `quality_preset(100)` without carrying the caller's chroma format — so on subsampled
-        // input that number is a *4:4:4* encode (3 257 157 B on bbb whether the request is 4:4:4
-        // or 4:2:0). The trigger would compare against an arm three times too large in chroma and
-        // never fire. It already fails closed, but by accident; this gate makes it deliberate,
-        // and it comes off with BUG-46.
+        // **4:4:4 only, deliberately, and the obstacle is BUG-49 rather than the trigger.**
+        // BUG-46 made `lossless_sibling` carry the caller's chroma format, so the trigger's number
+        // is honest now — but on subsampled chroma `q=100` is **2.7x to 20x worse in colour than
+        // `q=99`** (dE00 mean 0.139 -> 1.949 on blue_sky 4:2:0, p95 0.727 -> 5.742), so the
+        // bit-exact arm is worse on the axis it would be chosen to protect. There is no two-axis win
+        // to collect until that is fixed, which is why `encode` refuses the same comparison for
+        // stills (`0078`). This gate comes off with **BUG-49**, and the sequence sweep at 4:2:2
+        // and 4:2:0 is part of that item, not this one.
         let sequence_fallback = config.lossless_fallback
             && !config.is_lossless()
             && rate_ctrl.is_none()
@@ -1696,24 +1815,19 @@ impl EncoderPipeline {
                             );
                             self.dispatch_gpu_pad_cached(ctx, &mut cmd, padded_w, padded_h);
                             let bufs = self.cached.as_ref().unwrap();
-                            self.color.dispatch(
+                            self.preprocess_to_planes(
                                 ctx,
                                 &mut cmd,
                                 &bufs.input_buf,
                                 &bufs.color_out,
-                                padded_w,
-                                padded_h,
-                                true,
-                                cfg.is_lossless(),
-                            );
-                            self.deinterleaver.dispatch(
-                                ctx,
-                                &mut cmd,
-                                &bufs.color_out,
                                 &bufs.plane_a,
                                 &bufs.co_plane,
                                 &bufs.cg_plane,
+                                padded_w,
+                                padded_h,
                                 padded_pixels as u32,
+                                cfg.is_lossless(),
+                                cfg.color_space == crate::ColorSpace::YCoCgR,
                             );
 
                             let planes: [&wgpu::Buffer; 3] =
@@ -1934,24 +2048,19 @@ impl EncoderPipeline {
                                 });
                         self.dispatch_gpu_pad_cached(ctx, &mut cmd, padded_w, padded_h);
                         let bufs = self.cached.as_ref().unwrap();
-                        self.color.dispatch(
+                        self.preprocess_to_planes(
                             ctx,
                             &mut cmd,
                             &bufs.input_buf,
                             &bufs.color_out,
-                            padded_w,
-                            padded_h,
-                            true,
-                            cfg.is_lossless(),
-                        );
-                        self.deinterleaver.dispatch(
-                            ctx,
-                            &mut cmd,
-                            &bufs.color_out,
                             &bufs.plane_a,
                             &bufs.co_plane,
                             &bufs.cg_plane,
+                            padded_w,
+                            padded_h,
                             padded_pixels as u32,
+                            cfg.is_lossless(),
+                            cfg.color_space == crate::ColorSpace::YCoCgR,
                         );
 
                         let planes: [&wgpu::Buffer; 3] =
@@ -2257,24 +2366,19 @@ impl EncoderPipeline {
                     );
                     self.dispatch_gpu_pad_cached(ctx, &mut cmd, padded_w, padded_h);
                     let bufs = self.cached.as_ref().unwrap();
-                    self.color.dispatch(
+                    self.preprocess_to_planes(
                         ctx,
                         &mut cmd,
                         &bufs.input_buf,
                         &bufs.color_out,
-                        padded_w,
-                        padded_h,
-                        true,
-                        cfg.is_lossless(),
-                    );
-                    self.deinterleaver.dispatch(
-                        ctx,
-                        &mut cmd,
-                        &bufs.color_out,
                         &bufs.plane_a,
                         &bufs.co_plane,
                         &bufs.cg_plane,
+                        padded_w,
+                        padded_h,
                         padded_pixels as u32,
+                        cfg.is_lossless(),
+                        cfg.color_space == crate::ColorSpace::YCoCgR,
                     );
 
                     let planes: [&wgpu::Buffer; 3] =
@@ -2638,14 +2742,23 @@ impl EncoderPipeline {
             use wgpu::util::DeviceExt;
 
             let num_tiles = (info.tiles_x() * info.tiles_y()) as usize;
-            self.gpu_rice_encoder
-                .prepare_batch_staging(ctx, num_tiles, info.tile_size, batch_size, high_cfg.quantization_step);
+            self.gpu_rice_encoder.prepare_batch_staging(
+                ctx,
+                num_tiles,
+                info.tile_size,
+                batch_size,
+                high_cfg.quantization_step,
+            );
             // Write params_buf ONCE before the batch loop.  On Metal/wgpu write_buffer is
             // staged: only the last write before queue.submit takes effect.  All high frames
             // in a GOP share the same FrameInfo (same tile layout, same wavelet_levels),
             // so a single pre-write is both correct and sufficient.
-            self.gpu_rice_encoder
-                .write_params_buf_for_batch(ctx, &info, high_cfg.wavelet_levels, high_cfg.quantization_step);
+            self.gpu_rice_encoder.write_params_buf_for_batch(
+                ctx,
+                &info,
+                high_cfg.wavelet_levels,
+                high_cfg.quantization_step,
+            );
 
             let weights_luma = high_cfg.subband_weights.pack_weights();
             let weights_chroma = high_cfg.subband_weights.pack_weights_chroma();
@@ -2766,24 +2879,19 @@ impl EncoderPipeline {
                             padded_w,
                             padded_h,
                         );
-                        self.color.dispatch(
+                        self.preprocess_to_planes(
                             ctx,
                             &mut cmd_pre,
                             &sp_b.input_buf,
                             &sp_b.color_out,
-                            padded_w,
-                            padded_h,
-                            true,
-                            cfg.is_lossless(),
-                        );
-                        self.deinterleaver.dispatch(
-                            ctx,
-                            &mut cmd_pre,
-                            &sp_b.color_out,
                             &sp_b.plane_a,
                             &sp_b.co_plane,
                             &sp_b.cg_plane,
+                            padded_w,
+                            padded_h,
                             padded_pixels as u32,
+                            cfg.is_lossless(),
+                            cfg.color_space == crate::ColorSpace::YCoCgR,
                         );
                         let planes_b: [&wgpu::Buffer; 3] =
                             [&sp_b.plane_a, &sp_b.co_plane, &sp_b.cg_plane];
@@ -3148,24 +3256,19 @@ impl EncoderPipeline {
                 });
             // Forward, reversible: the same two dispatches `encode_once` runs on this buffer, so
             // the padded region is filled exactly as the coded planes were.
-            self.color.dispatch(
+            self.preprocess_to_planes(
                 ctx,
                 &mut cmd,
                 &bufs.input_buf,
                 &bufs.color_out,
-                padded_w,
-                padded_h,
-                true,
-                true,
-            );
-            self.deinterleaver.dispatch(
-                ctx,
-                &mut cmd,
-                &bufs.color_out,
                 &bufs.gpu_ref_planes[0],
                 &bufs.gpu_ref_planes[1],
                 &bufs.gpu_ref_planes[2],
+                padded_w,
+                padded_h,
                 padded_pixels as u32,
+                true,
+                config.color_space == crate::ColorSpace::YCoCgR,
             );
             ctx.queue.submit(std::iter::once(cmd.finish()));
             for p in 0..3 {
@@ -3572,8 +3675,7 @@ impl EncoderPipeline {
         } else if step <= P_SCALE_FINE_STEP {
             1.0
         } else {
-            1.0 + 0.25 * (step - P_SCALE_FINE_STEP)
-                / (P_SCALE_COARSE_STEP - P_SCALE_FINE_STEP)
+            1.0 + 0.25 * (step - P_SCALE_FINE_STEP) / (P_SCALE_COARSE_STEP - P_SCALE_FINE_STEP)
         };
         let p_qp_scale: f32 = std::env::var("GNC_P_QP_SCALE")
             .ok()
@@ -3620,14 +3722,16 @@ impl EncoderPipeline {
         // default is already 1.0, so an override to 1.0 is *correctly* a no-op and must not be
         // mistaken for a dead code path.
         if diagnostics::enabled() {
-            let src = if std::env::var("GNC_P_QP_SCALE").is_ok() { "env" } else { "taper" };
+            let src = if std::env::var("GNC_P_QP_SCALE").is_ok() {
+                "env"
+            } else {
+                "taper"
+            };
             println!(
                 "  p_qp_scale={p_qp_scale:.4} ({src}, default {p_qp_scale_default:.4}), \
                  intra_qstep={:.4} res_qstep={res_qstep:.4} inter_dz_mul={inter_dz_mul:.2} \
                  dz_intra={:.3} dz_referenced={:.3} dz_res={res_dead_zone:.3}",
-                config.quantization_step,
-                config.dead_zone,
-                config.dead_zone_referenced
+                config.quantization_step, config.dead_zone, config.dead_zone_referenced
             );
         }
 
@@ -3746,24 +3850,19 @@ impl EncoderPipeline {
             self.dispatch_gpu_pad_cached(ctx, &mut cmd, padded_w, padded_h);
 
             // Phase 1a/1b: Color conversion + deinterleave → plane_a/co_plane/cg_plane
-            self.color.dispatch(
+            self.preprocess_to_planes(
                 ctx,
                 &mut cmd,
                 &bufs.input_buf,
                 &bufs.color_out,
-                padded_w,
-                padded_h,
-                true,
-                config.is_lossless(),
-            );
-            self.deinterleaver.dispatch(
-                ctx,
-                &mut cmd,
-                &bufs.color_out,
                 &bufs.plane_a,
                 &bufs.co_plane,
                 &bufs.cg_plane,
+                padded_w,
+                padded_h,
                 padded_pixels as u32,
+                config.is_lossless(),
+                config.color_space == crate::ColorSpace::YCoCgR,
             );
         }
 
@@ -3772,9 +3871,7 @@ impl EncoderPipeline {
             // frame's Metal sync ran. Reuse the pre-computed MV buffers directly.
             if profile {
                 if skip_preprocess {
-                    eprintln!(
-                        "[me_pipeline] used precomputed ME (skipping phases 0b/1a/1b/2)"
-                    );
+                    eprintln!("[me_pipeline] used precomputed ME (skipping phases 0b/1a/1b/2)");
                 } else {
                     eprintln!("[me_pipeline] used precomputed ME (skipping phase 2 only)");
                 }
@@ -3811,7 +3908,12 @@ impl EncoderPipeline {
             let pyr_h = padded_h / 4;
             // Stage 1: downsample current + reference Y to pyramid resolution.
             self.motion.dispatch_downsample_4x(
-                ctx, &mut cmd, &bufs.plane_a, &bufs.pyr_plane_a, padded_w, padded_h,
+                ctx,
+                &mut cmd,
+                &bufs.plane_a,
+                &bufs.pyr_plane_a,
+                padded_w,
+                padded_h,
             );
             self.motion.dispatch_downsample_4x(
                 ctx,
@@ -3966,13 +4068,7 @@ impl EncoderPipeline {
             );
             // Copy smoothed MVs back into split_mv_buf so downstream MC uses them.
             // split_mv_buf has COPY_DST (added to estimate_split output_mv_buf).
-            cmd.copy_buffer_to_buffer(
-                smooth_scratch,
-                0,
-                &split_mv_buf,
-                0,
-                smooth_scratch.size(),
-            );
+            cmd.copy_buffer_to_buffer(smooth_scratch, 0, &split_mv_buf, 0, smooth_scratch.size());
         }
 
         // BUG-39 cause 4: a lossless configuration has to predict from integers.
@@ -3996,13 +4092,44 @@ impl EncoderPipeline {
         // `GNC_LOSSLESS_FULLPEL=0` restores sub-pel vectors for measurement — the arm that says
         // what full-pel costs in rate.
         let lossless_fullpel = config.is_lossless()
-            && std::env::var("GNC_LOSSLESS_FULLPEL").map(|v| v != "0").unwrap_or(true);
+            && std::env::var("GNC_LOSSLESS_FULLPEL")
+                .map(|v| v != "0")
+                .unwrap_or(true);
         if lossless_fullpel {
+            // **On a subsampled axis the quantum is two luma pixels, not one — LOSSLESS-5.**
+            // The chroma displacement is this vector halved on every axis chroma subsamples
+            // (`motion_mv_scale.wgsl` at 4:2:0; the luma-domain path at 4:2:2 box-filters a
+            // warped NN-upsampled plane, which comes to the same thing), so a *full-pel* luma
+            // vector is a **half-pel chroma** vector, `bilinear_ref` averages two reference
+            // samples, and the fractional prediction this rounding exists to remove comes
+            // straight back in Cb and Cr. Measured at q=100 on 8 frames, before this: luma exact,
+            // P-frames **66.5-70.4 dB** on `bbb.y4m` 4:2:0 and 7 of 8 frames inexact at 4:2:2.
+            //
+            // It stayed invisible because no source could expose it. Through the RGB path a Y4M's
+            // own samples can never come back (the BT.601 matrix is not integer-invertible, and
+            // BUG-45 rounds the fractional input anyway), so "P-frames are not bit-exact at
+            // 4:2:0" read as that already-known loss. A native Y'CbCr source has no such excuse,
+            // which is how LOSSLESS-5 found it.
+            //
+            // **The constraint belongs on the luma vector, not on the scaled chroma one.** The
+            // decoder halves the vectors the bitstream carries and does no rounding of its own,
+            // so rounding `mv_chroma_buf` here makes the two disagree — measured, and it drifts:
+            // 55.6 dB on the first P-frame falling to 46.4 dB by the eighth. A vector that is
+            // already a multiple of 8 arrives as a multiple of 4 on both sides, and the decoder
+            // needs no change and no bitstream generation.
+            //
+            // Per axis, because 4:2:2 subsamples only the columns and there is no reason to make
+            // its vertical vectors coarse.
+            let quantum = (
+                if chroma_shift_x > 0 { 8 } else { 4 },
+                if chroma_shift_y > 0 { 8 } else { 4 },
+            );
             self.motion.dispatch_mv_round_fullpel(
                 ctx,
                 &mut cmd,
                 &split_mv_buf,
                 bufs.split_total_blocks,
+                quantum,
             );
             // Canary (CLAUDE.md, "No silent features"): says the path ran and on how many
             // vectors, so "the gate never fired" and "it fired and did nothing" stay distinct.
@@ -4270,8 +4397,20 @@ impl EncoderPipeline {
         // catches tiles that are *static*; this catches tiles that are merely
         // well-predicted, which on a pure pan is the whole frame. Off by default
         // (GNC_TILE_SKIP_THRESH); see RESEARCH_LOG 2026-09-05.
+        // Refused at `q=100` for BUG-57's reason: it deletes coefficients, and the bit-exact
+        // rung has no quality to trade for the bits. It is off by default, so this only catches
+        // someone measuring with `GNC_TILE_SKIP_THRESH` at a lossless q.
         let p_skip_thr = tile_skip_threshold(config.quantization_step);
-        if matches!(entropy_mode, EntropyMode::Rice) && p_skip_thr > 0.0 {
+        if p_skip_thr > 0.0 && config.is_lossless() {
+            static LOSSLESS_SKIP_REFUSED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            LOSSLESS_SKIP_REFUSED.get_or_init(|| {
+                eprintln!(
+                    "GNC: GNC_TILE_SKIP_THRESH ignored at q=100 — coefficient-domain tile skip \
+                     deletes residual, which a bit-exact encode cannot do (BUG-57)."
+                );
+            });
+        }
+        if matches!(entropy_mode, EntropyMode::Rice) && p_skip_thr > 0.0 && !config.is_lossless() {
             self.dispatch_tile_skip(
                 ctx,
                 &mut cmd,
@@ -4316,7 +4455,27 @@ impl EncoderPipeline {
         // different tile grid than the luma skip map. To stay correct and simple, only
         // zero luma (recon_y) for non-444. Chroma gains are secondary and zeroing chroma
         // tiles at different tile granularity requires a separate map; defer to future work.
-        {
+        //
+        // **BUG-57: not at `q=100`.** Zeroing a tile's coefficients throws its residual away,
+        // which is a rate/quality trade and there is no quality to trade at the bit-exact rung.
+        // The tile that exposed it is the bottom-right corner at 1080p with `tile_size=256`: it
+        // is 128x56 of picture inside a 256x256 tile, so **89% of the mean this threshold takes
+        // is padding**, identical between frames and contributing a SAD of exactly zero. The
+        // mean falls under `qstep/2` while the real 11% still differs by +/-1, the tile is
+        // declared static, and its residual is deleted. Measured on `bbb.y4m` q=100 4:2:0: frame
+        // 2 decoded at **75.31 dB**, 3 606 luma samples wrong across exactly x 1792..1919,
+        // y 1024..1079, max error 10 — and `--tile-size 128` made it vanish, because at that size
+        // the same corner is 56 of 128 rows rather than 56 of 256 and clears the threshold.
+        //
+        // It survived because nothing could see it: the encoder's own reference at `q=100` is the
+        // *source* (`reference_from_source`), so the error never propagates into the next frame
+        // and never shows up as drift, and no Y4M encode was bit-exact end to end before
+        // LOSSLESS-5 for it to stand out against.
+        //
+        // **The MV forcing above stays on.** Setting a static tile's vectors to zero is exact —
+        // the residual is then coded against the same-position prediction — and it is what makes
+        // those tiles cheap in the first place. Only the deletion is the lossy half.
+        if !config.is_lossless() {
             // Always zero luma coefficients for skip tiles.
             self.dispatch_zero_skip_tiles_by_map(
                 ctx,
@@ -4348,19 +4507,24 @@ impl EncoderPipeline {
                     config.tile_size,
                 );
             }
+        }
 
-            // GNC_SKIP_DIAG: copy tile skip map to staging for CPU readback after submit.
-            if std::env::var_os("GNC_SKIP_DIAG").is_some() {
-                let map_count = bufs.tile_skip_map_count;
-                let map_bytes = (map_count as u64) * 4;
-                cmd.copy_buffer_to_buffer(
-                    &bufs.tile_skip_map_buf,
-                    0,
-                    &bufs.tile_skip_map_staging,
-                    0,
-                    map_bytes,
-                );
-            }
+        // GNC_SKIP_DIAG: copy tile skip map to staging for CPU readback after submit.
+        //
+        // **Outside the gate above on purpose.** The map records what the skip pass *decided*,
+        // which is a fact about the frame either way; leaving the copy inside meant that with the
+        // zeroing off the readback found a stale buffer and reported `skip_tiles=0`. That is how
+        // BUG-57's own instrument nearly talked me out of the diagnosis after the fix was in.
+        if std::env::var_os("GNC_SKIP_DIAG").is_some() {
+            let map_count = bufs.tile_skip_map_count;
+            let map_bytes = (map_count as u64) * 4;
+            cmd.copy_buffer_to_buffer(
+                &bufs.tile_skip_map_buf,
+                0,
+                &bufs.tile_skip_map_staging,
+                0,
+                map_bytes,
+            );
         }
 
         // Profiling: flush forward phase to measure GPU time
@@ -4404,9 +4568,11 @@ impl EncoderPipeline {
             });
             cmd.copy_buffer_to_buffer(&bufs.recon_y, 0, &staging, 0, buf_bytes);
             ctx.queue.submit(Some(cmd.finish()));
-            cmd = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("pf_after_ll_spatial"),
-            });
+            cmd = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("pf_after_ll_spatial"),
+                });
 
             // Readback
             {
@@ -4454,8 +4620,7 @@ impl EncoderPipeline {
                                 let x_curr = tx * tile_size + col;
                                 let x_left = (tx - 1) * tile_size + col;
                                 diff_sum +=
-                                    (coefs[y * pw + x_curr] - coefs[y * pw + x_left])
-                                        .abs() as f64;
+                                    (coefs[y * pw + x_curr] - coefs[y * pw + x_left]).abs() as f64;
                                 n += 1;
                             }
                         }
@@ -4846,12 +5011,17 @@ impl EncoderPipeline {
             let tiles_x = padded_w / config.tile_size;
             let tiles_y = padded_h / config.tile_size;
             eprintln!(
-                "[skip_diag] P-frame: skip_tiles={}/{} ({}×{} tile grid, threshold={:.2})",
+                "[skip_diag] P-frame: skip_tiles={}/{} ({}×{} tile grid, threshold={:.2}){}",
                 skip_count,
                 map_count,
                 tiles_x,
                 tiles_y,
                 tile_skip_motion_threshold(config.quantization_step),
+                if config.is_lossless() {
+                    " -- coefficients NOT zeroed: bit-exact encode (BUG-57)"
+                } else {
+                    ""
+                },
             );
         }
 
@@ -4938,30 +5108,30 @@ impl EncoderPipeline {
                             label: Some("pf_lookahead_me"),
                         });
                 self.dispatch_gpu_pad_cached(ctx, &mut me_cmd, padded_w, padded_h);
-                self.color.dispatch(
+                self.preprocess_to_planes(
                     ctx,
                     &mut me_cmd,
                     &bufs.input_buf,
                     &bufs.color_out,
-                    padded_w,
-                    padded_h,
-                    true,
-                    config.is_lossless(),
-                );
-                self.deinterleaver.dispatch(
-                    ctx,
-                    &mut me_cmd,
-                    &bufs.color_out,
                     &bufs.plane_a,
                     &bufs.co_plane,
                     &bufs.cg_plane,
+                    padded_w,
+                    padded_h,
                     padded_pixels as u32,
+                    config.is_lossless(),
+                    config.color_space == crate::ColorSpace::YCoCgR,
                 );
                 // Pyramid ME for look-ahead: same 4-stage flow as main path.
                 let la_pyr_w = padded_w / 4;
                 let la_pyr_h = padded_h / 4;
                 self.motion.dispatch_downsample_4x(
-                    ctx, &mut me_cmd, &bufs.plane_a, &bufs.pyr_plane_a, padded_w, padded_h,
+                    ctx,
+                    &mut me_cmd,
+                    &bufs.plane_a,
+                    &bufs.pyr_plane_a,
+                    padded_w,
+                    padded_h,
                 );
                 self.motion.dispatch_downsample_4x(
                     ctx,
@@ -5007,8 +5177,7 @@ impl EncoderPipeline {
                     &bufs.me_sad_buf,
                     &bufs.me_dummy_pred,
                 );
-                let next_lambda_sad =
-                    (config.quantization_step * 16.0 + 128.0).round() as u32;
+                let next_lambda_sad = (config.quantization_step * 16.0 + 128.0).round() as u32;
                 let next_split_mv = self.motion.estimate_split(
                     ctx,
                     &mut me_cmd,
@@ -5058,19 +5227,19 @@ impl EncoderPipeline {
                 [&bufs.recon_y, &bufs.co_plane, &bufs.plane_b]
             };
             for (p, quant_buf) in quant_bufs.iter().enumerate() {
-                let (enc_pixels, enc_w, enc_tiles_x, enc_tiles_y, enc_info) =
-                    if p > 0 && is_non_444 {
-                        let ci = chroma_info_pf.as_ref().unwrap();
-                        (
-                            chroma_pixels,
-                            chroma_padded_w,
-                            ci.tiles_x() as usize,
-                            ci.tiles_y() as usize,
-                            ci as &FrameInfo,
-                        )
-                    } else {
-                        (padded_pixels, padded_w, tiles_x, tiles_y, info)
-                    };
+                let (enc_pixels, enc_w, enc_tiles_x, enc_tiles_y, enc_info) = if p > 0 && is_non_444
+                {
+                    let ci = chroma_info_pf.as_ref().unwrap();
+                    (
+                        chroma_pixels,
+                        chroma_padded_w,
+                        ci.tiles_x() as usize,
+                        ci.tiles_y() as usize,
+                        ci as &FrameInfo,
+                    )
+                } else {
+                    (padded_pixels, padded_w, tiles_x, tiles_y, info)
+                };
                 encode_entropy(
                     &mut self.gpu_encoder,
                     &mut self.gpu_abac_encoder,
@@ -5177,9 +5346,7 @@ impl EncoderPipeline {
                 });
             c.copy_buffer_to_buffer(&bufs.gpu_ref_planes[0], 0, &stg_ref, 0, plane_size);
             ctx.queue.submit(Some(c.finish()));
-            diagnostics::dump_residual_plane(
-                ctx, &stg_ref, plane_size, padded_w, padded_h, "Pref",
-            );
+            diagnostics::dump_residual_plane(ctx, &stg_ref, plane_size, padded_w, padded_h, "Pref");
 
             // ... and the current luma plane, so the oracle sees exactly the pair GNC saw.
             let stg_cur = ctx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -5195,9 +5362,7 @@ impl EncoderPipeline {
                 });
             c2.copy_buffer_to_buffer(&bufs.plane_a, 0, &stg_cur, 0, plane_size);
             ctx.queue.submit(Some(c2.finish()));
-            diagnostics::dump_residual_plane(
-                ctx, &stg_cur, plane_size, padded_w, padded_h, "Pcur",
-            );
+            diagnostics::dump_residual_plane(ctx, &stg_cur, plane_size, padded_w, padded_h, "Pcur");
         }
 
         // MEAS-4: dump the spatial-domain MC residual (post-MC, pre-transform) for the
@@ -5287,7 +5452,7 @@ impl EncoderPipeline {
             EntropyMode::Rans => EntropyData::Rans(rans_tiles),
             EntropyMode::Rice => EntropyData::Rice(rice_tiles),
             EntropyMode::Huffman => EntropyData::Huffman(huffman_tiles),
-        EntropyMode::Abac => EntropyData::Abac(abac_tiles),
+            EntropyMode::Abac => EntropyData::Abac(abac_tiles),
         };
 
         (
@@ -5342,7 +5507,12 @@ impl EncoderPipeline {
         // Pixel data for the *next* B-frame in the group (if any).
         // When Some and use_rice+!is_non_444, submits look-ahead ME before Rice readback poll.
         next_frame_pixels: Option<&[f32]>,
-    ) -> (CompressedFrame, wgpu::Buffer, wgpu::Buffer, Option<PrecomputedBFrameME>) {
+    ) -> (
+        CompressedFrame,
+        wgpu::Buffer,
+        wgpu::Buffer,
+        Option<PrecomputedBFrameME>,
+    ) {
         let plane_size = (padded_pixels * std::mem::size_of::<f32>()) as u64;
 
         self.ensure_cached(
@@ -5502,24 +5672,19 @@ impl EncoderPipeline {
             self.dispatch_gpu_pad_cached(ctx, &mut cmd, padded_w, padded_h);
 
             // Phase 1a: Color conversion + deinterleave
-            self.color.dispatch(
+            self.preprocess_to_planes(
                 ctx,
                 &mut cmd,
                 &bufs.input_buf,
                 &bufs.color_out,
-                padded_w,
-                padded_h,
-                true,
-                config.is_lossless(),
-            );
-            self.deinterleaver.dispatch(
-                ctx,
-                &mut cmd,
-                &bufs.color_out,
                 &bufs.plane_a,
                 &bufs.co_plane,
                 &bufs.cg_plane,
+                padded_w,
+                padded_h,
                 padded_pixels as u32,
+                config.is_lossless(),
+                config.color_space == crate::ColorSpace::YCoCgR,
             );
         }
 
@@ -5567,11 +5732,11 @@ impl EncoderPipeline {
         // Y-plane drives the skip decision; chroma follows via the MV scaling path.
         {
             let skip_thr = tile_skip_motion_threshold(config.quantization_step);
-            let mut skip_cmd =
-                ctx.device
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("bf_skip_bidir"),
-                    });
+            let mut skip_cmd = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("bf_skip_bidir"),
+                });
             self.dispatch_tile_skip_bidir(
                 ctx,
                 &mut skip_cmd,
@@ -5950,35 +6115,27 @@ impl EncoderPipeline {
             // for the next frame, and co_plane holds this frame's quantised Co coefficients,
             // which the CPU entropy stage has not read yet.
             if gpu_entropy && use_rice && !is_non_444 {
-                ctx.queue.write_buffer(
-                    &bufs.raw_input_buf,
-                    0,
-                    bytemuck::cast_slice(next_pixels),
-                );
+                ctx.queue
+                    .write_buffer(&bufs.raw_input_buf, 0, bytemuck::cast_slice(next_pixels));
                 let mut me_cmd =
                     ctx.device
                         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                             label: Some("bf_lookahead_me"),
                         });
                 self.dispatch_gpu_pad_cached(ctx, &mut me_cmd, padded_w, padded_h);
-                self.color.dispatch(
+                self.preprocess_to_planes(
                     ctx,
                     &mut me_cmd,
                     &bufs.input_buf,
                     &bufs.color_out,
-                    padded_w,
-                    padded_h,
-                    true,
-                    config.is_lossless(),
-                );
-                self.deinterleaver.dispatch(
-                    ctx,
-                    &mut me_cmd,
-                    &bufs.color_out,
                     &bufs.plane_a,
                     &bufs.co_plane,
                     &bufs.cg_plane,
+                    padded_w,
+                    padded_h,
                     padded_pixels as u32,
+                    config.is_lossless(),
+                    config.color_space == crate::ColorSpace::YCoCgR,
                 );
                 // Use current frame's MVs as temporal predictor for the look-ahead.
                 let bidir_params_la = &bufs.bidir_params_pred;
@@ -6025,19 +6182,19 @@ impl EncoderPipeline {
                 [&bufs.recon_y, &bufs.co_plane, &bufs.plane_b]
             };
             for (p, quant_buf) in quant_bufs.iter().enumerate() {
-                let (enc_pixels, enc_w, enc_tiles_x, enc_tiles_y, enc_info) =
-                    if p > 0 && is_non_444 {
-                        let ci = chroma_info_bf.as_ref().unwrap();
-                        (
-                            chroma_pixels,
-                            chroma_padded_w,
-                            ci.tiles_x() as usize,
-                            ci.tiles_y() as usize,
-                            ci as &FrameInfo,
-                        )
-                    } else {
-                        (padded_pixels, padded_w, tiles_x, tiles_y, info)
-                    };
+                let (enc_pixels, enc_w, enc_tiles_x, enc_tiles_y, enc_info) = if p > 0 && is_non_444
+                {
+                    let ci = chroma_info_bf.as_ref().unwrap();
+                    (
+                        chroma_pixels,
+                        chroma_padded_w,
+                        ci.tiles_x() as usize,
+                        ci.tiles_y() as usize,
+                        ci as &FrameInfo,
+                    )
+                } else {
+                    (padded_pixels, padded_w, tiles_x, tiles_y, info)
+                };
                 encode_entropy(
                     &mut self.gpu_encoder,
                     &mut self.gpu_abac_encoder,
@@ -6171,7 +6328,7 @@ impl EncoderPipeline {
             EntropyMode::Rans => EntropyData::Rans(rans_tiles),
             EntropyMode::Rice => EntropyData::Rice(rice_tiles),
             EntropyMode::Huffman => EntropyData::Huffman(huffman_tiles),
-        EntropyMode::Abac => EntropyData::Abac(abac_tiles),
+            EntropyMode::Abac => EntropyData::Abac(abac_tiles),
         };
 
         (
@@ -6337,8 +6494,11 @@ impl EncoderPipeline {
 
         let is_non_444 = info.chroma_format != ChromaFormat::Yuv444;
         let is_420 = info.chroma_format == ChromaFormat::Yuv420;
-        let chroma_info_opt: Option<FrameInfo> =
-            if is_non_444 { Some(info.make_chroma_info()) } else { None };
+        let chroma_info_opt: Option<FrameInfo> = if is_non_444 {
+            Some(info.make_chroma_info())
+        } else {
+            None
+        };
         let chroma_shift_x = info.chroma_format.horiz_shift();
         let chroma_shift_y = info.chroma_format.vert_shift();
         let (chroma_padded_w, chroma_padded_h, chroma_pixels) =
@@ -6470,7 +6630,7 @@ impl EncoderPipeline {
                     &bufs.mv_chroma_buf,     // scaled fwd MVs
                     &bufs.mv_chroma_buf_bwd, // scaled bwd MVs
                     &bufs.bidir_modes_scratch,
-                    chroma_scratch,          // output: reconstructed at chroma dims
+                    chroma_scratch, // output: reconstructed at chroma dims
                     chroma_padded_w,
                     chroma_padded_h,
                     false, // inverse: recon = residual + prediction
@@ -6726,24 +6886,19 @@ impl EncoderPipeline {
             });
 
         self.dispatch_gpu_pad_cached(ctx, &mut cmd, padded_w, padded_h);
-        self.color.dispatch(
+        self.preprocess_to_planes(
             ctx,
             &mut cmd,
             &bufs.input_buf,
             &bufs.color_out,
-            padded_w,
-            padded_h,
-            true,
-            config.is_lossless(),
-        );
-        self.deinterleaver.dispatch(
-            ctx,
-            &mut cmd,
-            &bufs.color_out,
             &bufs.plane_a,
             &bufs.co_plane,
             &bufs.cg_plane,
+            padded_w,
+            padded_h,
             padded_pixels as u32,
+            config.is_lossless(),
+            config.color_space == crate::ColorSpace::YCoCgR,
         );
 
         let weights_luma = config.subband_weights.pack_weights();
@@ -6830,24 +6985,19 @@ impl EncoderPipeline {
             });
 
         self.dispatch_gpu_pad_cached(ctx, &mut cmd, padded_w, padded_h);
-        self.color.dispatch(
+        self.preprocess_to_planes(
             ctx,
             &mut cmd,
             &bufs.input_buf,
             &bufs.color_out,
-            padded_w,
-            padded_h,
-            true,
-            config.is_lossless(),
-        );
-        self.deinterleaver.dispatch(
-            ctx,
-            &mut cmd,
-            &bufs.color_out,
             &bufs.plane_a,
             &bufs.co_plane,
             &bufs.cg_plane,
+            padded_w,
+            padded_h,
             padded_pixels as u32,
+            config.is_lossless(),
+            config.color_space == crate::ColorSpace::YCoCgR,
         );
 
         let planes: [&wgpu::Buffer; 3] = [&bufs.plane_a, &bufs.co_plane, &bufs.cg_plane];

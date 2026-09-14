@@ -83,77 +83,165 @@ fn configs() -> Vec<(&'static str, spv::Options<'static>)> {
     vec![
         // The control: naga's own defaults, which is what the CLI emits and what passed
         // `spirv-val` and did NOT crash the driver.
-        ("naga_default", mk(default_lang, default_flags, default_bounds, default_zero)),
+        (
+            "naga_default",
+            mk(default_lang, default_flags, default_bounds, default_zero),
+        ),
         // One knob at a time away from that control.
-        ("zero_native", mk(default_lang, default_flags, default_bounds, Z::Native)),
-        ("zero_none", mk(default_lang, default_flags, default_bounds, Z::None)),
-        ("zero_polyfill", mk(default_lang, default_flags, default_bounds, Z::Polyfill)),
-        ("bounds_restrict", mk(default_lang, default_flags, restrict, default_zero)),
-        ("bounds_unchecked", mk(default_lang, default_flags, unchecked, default_zero)),
-        ("lang_1_0", mk((1, 0), default_flags, default_bounds, default_zero)),
-        ("lang_1_3", mk((1, 3), default_flags, default_bounds, default_zero)),
-        ("flags_wgpu", mk(default_lang, base_flags, default_bounds, default_zero)),
+        (
+            "zero_native",
+            mk(default_lang, default_flags, default_bounds, Z::Native),
+        ),
+        (
+            "zero_none",
+            mk(default_lang, default_flags, default_bounds, Z::None),
+        ),
+        (
+            "zero_polyfill",
+            mk(default_lang, default_flags, default_bounds, Z::Polyfill),
+        ),
+        (
+            "bounds_restrict",
+            mk(default_lang, default_flags, restrict, default_zero),
+        ),
+        (
+            "bounds_unchecked",
+            mk(default_lang, default_flags, unchecked, default_zero),
+        ),
+        (
+            "lang_1_0",
+            mk((1, 0), default_flags, default_bounds, default_zero),
+        ),
+        (
+            "lang_1_3",
+            mk((1, 3), default_flags, default_bounds, default_zero),
+        ),
+        (
+            "flags_wgpu",
+            mk(default_lang, base_flags, default_bounds, default_zero),
+        ),
         // wgpu's Vulkan combination, as reconstructed from wgpu-hal's adapter.rs.
         ("wgpu_native", mk((1, 0), base_flags, restrict, Z::Native)),
-        ("wgpu_polyfill", mk((1, 0), base_flags, restrict, Z::Polyfill)),
+        (
+            "wgpu_polyfill",
+            mk((1, 0), base_flags, restrict, Z::Polyfill),
+        ),
         // `Options::default()` sets WriterFlags::DEBUG only under `debug_assertions`, so a
         // release build of naga emits a *different module* from a debug build. That makes the
         // presence of debug names a variable in its own right, and it is the only difference left
         // between this emitter and the naga CLI whose output was valid.
-        ("debug_on", mk(default_lang, default_flags | spv::WriterFlags::DEBUG, default_bounds, default_zero)),
-        ("debug_off", mk(default_lang, default_flags - spv::WriterFlags::DEBUG, default_bounds, default_zero)),
-        ("debug_on_restrict", mk(default_lang, default_flags | spv::WriterFlags::DEBUG, restrict, default_zero)),
-        ("wgpu_native_debug", mk((1, 0), base_flags | spv::WriterFlags::DEBUG, restrict, Z::Native)),
+        (
+            "debug_on",
+            mk(
+                default_lang,
+                default_flags | spv::WriterFlags::DEBUG,
+                default_bounds,
+                default_zero,
+            ),
+        ),
+        (
+            "debug_off",
+            mk(
+                default_lang,
+                default_flags - spv::WriterFlags::DEBUG,
+                default_bounds,
+                default_zero,
+            ),
+        ),
+        (
+            "debug_on_restrict",
+            mk(
+                default_lang,
+                default_flags | spv::WriterFlags::DEBUG,
+                restrict,
+                default_zero,
+            ),
+        ),
+        (
+            "wgpu_native_debug",
+            mk(
+                (1, 0),
+                base_flags | spv::WriterFlags::DEBUG,
+                restrict,
+                Z::Native,
+            ),
+        ),
         // `Restrict` split by policy. The reduced reproducer is `OpArrayLength` + `OpISub`, which
         // is the *buffer* check (`min(i, arrayLength(buf) - 1)`), not the index check — so these
         // two separate a driver bug about storage-buffer bounds from one about array indexing.
-        ("index_restrict_only", mk((1, 0), base_flags, BoundsCheckPolicies {
-            index: BoundsCheckPolicy::Restrict,
-            buffer: BoundsCheckPolicy::Unchecked,
-            image_load: BoundsCheckPolicy::Unchecked,
-            binding_array: BoundsCheckPolicy::Unchecked,
-        }, Z::Native)),
-        ("buffer_restrict_only", mk((1, 0), base_flags, BoundsCheckPolicies {
-            index: BoundsCheckPolicy::Unchecked,
-            buffer: BoundsCheckPolicy::Restrict,
-            image_load: BoundsCheckPolicy::Unchecked,
-            binding_array: BoundsCheckPolicy::Unchecked,
-        }, Z::Native)),
+        (
+            "index_restrict_only",
+            mk(
+                (1, 0),
+                base_flags,
+                BoundsCheckPolicies {
+                    index: BoundsCheckPolicy::Restrict,
+                    buffer: BoundsCheckPolicy::Unchecked,
+                    image_load: BoundsCheckPolicy::Unchecked,
+                    binding_array: BoundsCheckPolicy::Unchecked,
+                },
+                Z::Native,
+            ),
+        ),
+        (
+            "buffer_restrict_only",
+            mk(
+                (1, 0),
+                base_flags,
+                BoundsCheckPolicies {
+                    index: BoundsCheckPolicy::Unchecked,
+                    buffer: BoundsCheckPolicy::Restrict,
+                    image_load: BoundsCheckPolicy::Unchecked,
+                    binding_array: BoundsCheckPolicy::Unchecked,
+                },
+                Z::Native,
+            ),
+        ),
         // The last untested difference from wgpu: it passes `capabilities: Some([...])`, which
         // constrains what the writer may emit and can change lowering. Everything above passes
         // `None`. This adapter reports `robustBufferAccess2 = true`, so wgpu should be asking for
         // `buffer: Unchecked` — and that configuration does *not* crash — yet the real WGSL path
         // does. One of those two things is wrong, and this is the remaining candidate.
-        ("caps_index_restrict", spv::Options {
-            lang_version: (1, 0),
-            flags: base_flags,
-            capabilities: Some(wgpu_caps()),
-            bounds_check_policies: BoundsCheckPolicies {
-                index: BoundsCheckPolicy::Restrict,
-                buffer: BoundsCheckPolicy::Unchecked,
-                image_load: BoundsCheckPolicy::Unchecked,
-                binding_array: BoundsCheckPolicy::Unchecked,
+        (
+            "caps_index_restrict",
+            spv::Options {
+                lang_version: (1, 0),
+                flags: base_flags,
+                capabilities: Some(wgpu_caps()),
+                bounds_check_policies: BoundsCheckPolicies {
+                    index: BoundsCheckPolicy::Restrict,
+                    buffer: BoundsCheckPolicy::Unchecked,
+                    image_load: BoundsCheckPolicy::Unchecked,
+                    binding_array: BoundsCheckPolicy::Unchecked,
+                },
+                zero_initialize_workgroup_memory: Z::Native,
+                binding_map: Default::default(),
+                debug_info: None,
             },
-            zero_initialize_workgroup_memory: Z::Native,
-            binding_map: Default::default(),
-            debug_info: None,
-        }),
-        ("caps_wgpu_native", spv::Options {
-            lang_version: (1, 0),
-            flags: base_flags,
-            capabilities: Some(wgpu_caps()),
-            bounds_check_policies: restrict,
-            zero_initialize_workgroup_memory: Z::Native,
-            binding_map: Default::default(),
-            debug_info: None,
-        }),
+        ),
+        (
+            "caps_wgpu_native",
+            spv::Options {
+                lang_version: (1, 0),
+                flags: base_flags,
+                capabilities: Some(wgpu_caps()),
+                bounds_check_policies: restrict,
+                zero_initialize_workgroup_memory: Z::Native,
+                binding_map: Default::default(),
+                debug_info: None,
+            },
+        ),
     ]
 }
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let shader = args.next().expect("usage: bug25_emit <shader.wgsl> <out_dir> [--wgpu-only]");
-    let out_dir = args.next().expect("usage: bug25_emit <shader.wgsl> <out_dir> [--wgpu-only]");
+    let shader = args
+        .next()
+        .expect("usage: bug25_emit <shader.wgsl> <out_dir> [--wgpu-only]");
+    let out_dir = args
+        .next()
+        .expect("usage: bug25_emit <shader.wgsl> <out_dir> [--wgpu-only]");
     // `--wgpu-only` emits wgpu's two possible Vulkan configurations, named after the shader, so the
     // whole tree can be swept in one pass instead of one directory of variants per shader. Both,
     // not one: which of them wgpu ships depends on whether the adapter reports

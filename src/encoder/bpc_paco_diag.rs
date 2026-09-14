@@ -157,8 +157,8 @@ impl BpcStats {
             match table.p.get(&(key.0, key.1, c)) {
                 Some(&p) => {
                     let p = p.clamp(1.0 / 65536.0, 1.0 - 1.0 / 65536.0);
-                    bits += bc.ones as f64 * -p.log2()
-                        + (bc.n - bc.ones) as f64 * -(1.0 - p).log2();
+                    bits +=
+                        bc.ones as f64 * -p.log2() + (bc.n - bc.ones) as f64 * -(1.0 - p).log2();
                 }
                 None => {
                     bits += bc.n as f64;
@@ -202,7 +202,10 @@ impl BpcTable {
             .filter(|(_, (n, _))| *n > 0)
             .map(|(k, (n, ones))| (k, ones as f64 / n as f64))
             .collect();
-        Ok(Self { p, source: path.to_string() })
+        Ok(Self {
+            p,
+            source: path.to_string(),
+        })
     }
 }
 
@@ -386,7 +389,11 @@ mod tests {
     fn lockstep_scan_sees_three_and_five_neighbours() {
         let (w, h) = (16usize, 16usize);
         let order = visit_order(w, h);
-        assert_eq!(order.len(), w * h, "every coefficient is visited exactly once");
+        assert_eq!(
+            order.len(),
+            w * h,
+            "every coefficient is visited exactly once"
+        );
 
         let mut visited = vec![false; w * h];
         let mut per_column = [Vec::new(), Vec::new()];
@@ -409,11 +416,22 @@ mod tests {
             visited[y * w + x] = true;
         }
 
-        assert!(per_column[0].iter().all(|&n| n == 3), "left column: {:?}", per_column[0]);
-        assert!(per_column[1].iter().all(|&n| n == 5), "right column: {:?}", per_column[1]);
+        assert!(
+            per_column[0].iter().all(|&n| n == 3),
+            "left column: {:?}",
+            per_column[0]
+        );
+        assert!(
+            per_column[1].iter().all(|&n| n == 5),
+            "right column: {:?}",
+            per_column[1]
+        );
         let all: Vec<usize> = per_column.concat();
         let avnp = all.iter().sum::<usize>() as f64 / all.len() as f64;
-        assert!((avnp - 4.0).abs() < 1e-9, "AVNP is {avnp}, JPEG 2000's raster scan gets 4");
+        assert!(
+            (avnp - 4.0).abs() < 1e-9,
+            "AVNP is {avnp}, JPEG 2000's raster scan gets 4"
+        );
     }
 
     /// The no-exchange variant must be strictly less informed, so it cannot cost less. This is

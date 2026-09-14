@@ -264,11 +264,7 @@ pub(super) fn entropy_encode_tiles(
                     rans_tiles.push(rans::rans_encode_tile_interleaved_zrl(&coeffs));
                 }
                 EntropyMode::Rice => {
-                    rice_tiles.push(rice::rice_encode_tile(
-                        &coeffs,
-                        tile_size_u32,
-                        num_levels,
-                    ));
+                    rice_tiles.push(rice::rice_encode_tile(&coeffs, tile_size_u32, num_levels));
                 }
                 EntropyMode::Huffman => {
                     huffman_tiles.push(huffman::huffman_encode_tile(

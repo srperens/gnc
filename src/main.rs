@@ -17,7 +17,10 @@ use gnc::format::{
     deserialize_temporal_sequence, seek_to_keyframe, serialize_compressed, serialize_sequence,
     serialize_temporal_sequence,
 };
-use gnc::image_util::{load_image_rgb_f32, load_image_rgb_f32_bits, parse_chroma_format, parse_wavelet_type, save_image_rgb_f32_bits};
+use gnc::image_util::{
+    load_image_rgb_f32, load_image_rgb_f32_bits, parse_chroma_format, parse_wavelet_type,
+    save_image_rgb_f32_bits,
+};
 use gnc::{
     CodecConfig, CompressedFrame, EntropyData, FrameType, GpuContext, RateMode, TemporalTransform,
 };
@@ -44,6 +47,7 @@ fn max_val_for_depth(bit_depth: u32) -> f64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Y4mChroma {
     C420,
+    C422,
     C444,
 }
 
@@ -57,6 +61,10 @@ struct Y4mReader {
     pub fps_num: u32,
     pub fps_den: u32,
     chroma: Y4mChroma,
+    /// **LOSSLESS-5.** When set, `read_frame_interleaved` hands back the file's own Y'CbCr
+    /// instead of BT.601 RGB. Off by default so an existing caller keeps the picture it had;
+    /// the sequence commands turn it on for Y4M input unless `GNC_RGB_PATH=1`.
+    native: bool,
 }
 
 impl Y4mReader {
@@ -97,10 +105,26 @@ impl Y4mReader {
                 Some('C') => {
                     let fmt = &token[1..];
                     let fmt_base = fmt.trim_start_matches(|c: char| !c.is_ascii_digit());
+                    // **BUG-56.** This used to be `starts_with("444")` or else 4:2:0, so every
+                    // format that was not 4:4:4 was *assumed* to be 4:2:0. A `C422` file has twice
+                    // the chroma rows that assumption allocates: the reader consumed half of them,
+                    // walked off the plane boundary, and panicked at the next frame header — while
+                    // GOALS §1 headlines 10-bit 4:2:2 and the encoder has coded it for months.
+                    //
+                    // Refuse what is not recognised, by name. A guessed chroma format is not an
+                    // error anyone sees; it is a wrong picture, or a panic three frames later.
                     chroma = if fmt_base.starts_with("444") {
                         Y4mChroma::C444
+                    } else if fmt_base.starts_with("422") {
+                        Y4mChroma::C422
+                    } else if fmt_base.starts_with("420") {
+                        Y4mChroma::C420 // 420jpeg / 420mpeg2 / 420paldv / plain 420
                     } else {
-                        Y4mChroma::C420 // default; 420jpeg / 420mpeg2 / plain 420
+                        panic!(
+                            "Y4M chroma format 'C{fmt}' is not supported (known: 420, 422, 444, \
+                             each optionally with a bit-depth suffix). Refusing rather than \
+                             guessing — a wrong chroma format decodes as a wrong picture (BUG-56)."
+                        )
                     };
                     // The bit-depth suffix ("420p10", "444p10") used to be stripped and
                     // discarded, so a 10-bit file was read as 8-bit — half the samples, and
@@ -114,11 +138,34 @@ impl Y4mReader {
             }
         }
         assert!(width > 0 && height > 0, "Y4M header missing W/H");
-        Y4mReader { reader, width, height, fps_num, fps_den, chroma, bit_depth }
+        Y4mReader {
+            reader,
+            width,
+            height,
+            fps_num,
+            fps_den,
+            chroma,
+            bit_depth,
+            native: false,
+        }
     }
 
-    /// Read one frame and return interleaved RGB f32 (0-255), or None at EOF.
-    fn read_frame_rgb(&mut self) -> Option<Vec<f32>> {
+    /// The chroma format these planes arrive in, as the codec names it.
+    fn chroma_format(&self) -> gnc::ChromaFormat {
+        match self.chroma {
+            Y4mChroma::C420 => gnc::ChromaFormat::Yuv420,
+            Y4mChroma::C422 => gnc::ChromaFormat::Yuv422,
+            Y4mChroma::C444 => gnc::ChromaFormat::Yuv444,
+        }
+    }
+
+    /// Read one frame as its three planes, at their own resolutions, or None at EOF.
+    ///
+    /// **LOSSLESS-4.** This is the frame as the file actually stores it. `read_frame_rgb` below
+    /// converts it with BT.601, which is what every caller used to do — and that conversion is
+    /// both irreversible (the matrix is not integer-invertible, so these samples cannot come back)
+    /// and expensive (coding its output costs 39.2% more bits than coding these planes).
+    fn read_frame_planes(&mut self) -> Option<(Vec<f32>, Vec<f32>, Vec<f32>)> {
         use std::io::BufRead;
         use std::io::Read;
 
@@ -171,9 +218,72 @@ impl Y4mReader {
                 let uv_size = w.div_ceil(2) * h.div_ceil(2);
                 (read_plane(uv_size, "Cb"), read_plane(uv_size, "Cr"))
             }
+            // 4:2:2 halves the columns only — every luma row has its own chroma row.
+            Y4mChroma::C422 => {
+                let uv_size = w.div_ceil(2) * h;
+                (read_plane(uv_size, "Cb"), read_plane(uv_size, "Cr"))
+            }
             Y4mChroma::C444 => (read_plane(y_size, "Cb"), read_plane(y_size, "Cr")),
         };
 
+        Some((y_plane, cb_plane, cr_plane))
+    }
+
+    /// One frame, interleaved, in whichever colour space this reader was opened for.
+    ///
+    /// **LOSSLESS-5.** `native` returns the file's own Y'CbCr; otherwise BT.601 RGB, which is
+    /// what every caller got before. The sequence encoder takes interleaved triples, so the
+    /// native arm reaches it through the same door the RGB arm uses and needs no second entry
+    /// point into `sequence.rs` — the encoder's own `color_space` field is what decides whether
+    /// the matrix runs, at both ends.
+    ///
+    /// **Subsampled chroma survives this round trip exactly**, which is the reason a 4:2:0 clip
+    /// can come through an interleaved buffer at all: the replication below is nearest-neighbour,
+    /// and the encoder's chroma downsample is the average of the 2x1 / 2x2 block it replicated
+    /// from — an average of identical integers, so the planes the codec quantises are the file's
+    /// own samples and not a resampling of them. `chroma_4_2_0_survives_the_interleaved_round_trip`
+    /// in `tests/lossless5_native_video.rs` is the guard, because this is an assumption about a
+    /// shader, not about this function.
+    fn read_frame_interleaved(&mut self) -> Option<Vec<f32>> {
+        if !self.native {
+            return self.read_frame_rgb();
+        }
+        let (y_plane, cb_plane, cr_plane) = self.read_frame_planes()?;
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let mut out = vec![0.0f32; w * h * 3];
+        for row in 0..h {
+            for col in 0..w {
+                let (cb, cr) = match self.chroma {
+                    Y4mChroma::C444 => {
+                        let idx = row * w + col;
+                        (cb_plane[idx], cr_plane[idx])
+                    }
+                    Y4mChroma::C420 => {
+                        let uv_w = w.div_ceil(2);
+                        let idx = (row / 2) * uv_w + col / 2;
+                        (cb_plane[idx], cr_plane[idx])
+                    }
+                    Y4mChroma::C422 => {
+                        let uv_w = w.div_ceil(2);
+                        let idx = row * uv_w + col / 2;
+                        (cb_plane[idx], cr_plane[idx])
+                    }
+                };
+                let base = (row * w + col) * 3;
+                out[base] = y_plane[row * w + col];
+                out[base + 1] = cb;
+                out[base + 2] = cr;
+            }
+        }
+        Some(out)
+    }
+
+    /// Read one frame and return interleaved RGB f32 (0-255), or None at EOF.
+    fn read_frame_rgb(&mut self) -> Option<Vec<f32>> {
+        let (y_plane, cb_plane, cr_plane) = self.read_frame_planes()?;
+        let w = self.width as usize;
+        let h = self.height as usize;
         // Convert YCbCr → RGB f32 (0-255), BT.601 limited-range (studio swing).
         //   Y:  16-235 (luma)
         //   Cb/Cr: 16-240 (chroma, centre at 128)
@@ -192,9 +302,12 @@ impl Y4mReader {
                     }
                     Y4mChroma::C420 => {
                         let uv_w = w.div_ceil(2);
-                        let uv_row = row / 2;
-                        let uv_col = col / 2;
-                        let idx = uv_row * uv_w + uv_col;
+                        let idx = (row / 2) * uv_w + col / 2;
+                        (cb_plane[idx], cr_plane[idx])
+                    }
+                    Y4mChroma::C422 => {
+                        let uv_w = w.div_ceil(2);
+                        let idx = row * uv_w + col / 2;
                         (cb_plane[idx], cr_plane[idx])
                     }
                 };
@@ -220,6 +333,10 @@ struct Y4mWriter {
     writer: std::io::BufWriter<std::fs::File>,
     width: usize,
     height: usize,
+    /// **LOSSLESS-5.** When set, the interleaved input already *is* Y'CbCr and the BT.601 matrix
+    /// below must not run. Applying it to both the reference and the distorted stream would be
+    /// symmetric and still wrong: VMAF would be scoring a pair of doubly-converted pictures.
+    native: bool,
 }
 
 impl Y4mWriter {
@@ -235,10 +352,16 @@ impl Y4mWriter {
             width, height, fps_num, fps_den
         )
         .expect("Y4M header write failed");
-        Self { writer, width, height }
+        Self {
+            writer,
+            width,
+            height,
+            native: false,
+        }
     }
 
-    /// Write one frame. `rgb` is interleaved R,G,B f32 values in [0,255].
+    /// Write one frame. `rgb` is interleaved R,G,B f32 values in [0,255] — or, when this writer
+    /// was made by `create_native`, interleaved Y',Cb,Cr on the same scale.
     fn write_frame(&mut self, rgb: &[f32]) {
         use std::io::Write;
         let w = self.width;
@@ -255,26 +378,35 @@ impl Y4mWriter {
         for row in 0..h {
             for col in 0..w {
                 let base = (row * w + col) * 3;
-                let r = rgb[base];
-                let g = rgb[base + 1];
-                let b = rgb[base + 2];
-                let y = (0.299 * r + 0.587 * g + 0.114 * b).clamp(0.0, 255.0) as u8;
-                y_plane[row * w + col] = y;
+                let (c0, c1, c2) = (rgb[base], rgb[base + 1], rgb[base + 2]);
+                let (y, cb, cr) = if self.native {
+                    (c0, c1, c2)
+                } else {
+                    let (r, g, b) = (c0, c1, c2);
+                    (
+                        0.299 * r + 0.587 * g + 0.114 * b,
+                        -0.168736 * r - 0.331264 * g + 0.5 * b + 128.0,
+                        0.5 * r - 0.418688 * g - 0.081312 * b + 128.0,
+                    )
+                };
+                y_plane[row * w + col] = y.clamp(0.0, 255.0) as u8;
                 // Subsample chroma: average 2×2 block top-left pixel (fast approximation)
                 if row % 2 == 0 && col % 2 == 0 {
-                    let cb = (-0.168736 * r - 0.331264 * g + 0.5 * b + 128.0).clamp(0.0, 255.0) as u8;
-                    let cr = (0.5 * r - 0.418688 * g - 0.081312 * b + 128.0).clamp(0.0, 255.0) as u8;
                     let uv_idx = (row / 2) * uv_w + (col / 2);
-                    cb_plane[uv_idx] = cb;
-                    cr_plane[uv_idx] = cr;
+                    cb_plane[uv_idx] = cb.clamp(0.0, 255.0) as u8;
+                    cr_plane[uv_idx] = cr.clamp(0.0, 255.0) as u8;
                 }
             }
         }
 
         writeln!(self.writer, "FRAME").expect("Y4M FRAME write failed");
         self.writer.write_all(&y_plane).expect("Y4M Y write failed");
-        self.writer.write_all(&cb_plane).expect("Y4M Cb write failed");
-        self.writer.write_all(&cr_plane).expect("Y4M Cr write failed");
+        self.writer
+            .write_all(&cb_plane)
+            .expect("Y4M Cb write failed");
+        self.writer
+            .write_all(&cr_plane)
+            .expect("Y4M Cr write failed");
     }
 
     fn flush(&mut self) {
@@ -283,15 +415,54 @@ impl Y4mWriter {
     }
 }
 
+/// **LOSSLESS-5.** Whether a Y4M input is coded as its own Y'CbCr rather than converted to RGB
+/// first. On by default; `GNC_RGB_PATH=1` is the other arm, which is the switch LOSSLESS-4 gave
+/// the still path and the only way to measure the two against each other.
+fn y4m_native_path() -> bool {
+    !std::env::var("GNC_RGB_PATH")
+        .map(|v| v != "0")
+        .unwrap_or(false)
+}
+
+/// Point a config at the source's own colour space and chroma format.
+///
+/// The chroma format is a property of the file, not a request — coding a 4:2:0 clip at any other
+/// sampling means resampling its planes, which is the cost this path exists to avoid. Same rule
+/// the still path applies in `Command::Encode`.
+fn use_source_colour(config: &mut CodecConfig, chroma: gnc::ChromaFormat) {
+    config.color_space = gnc::ColorSpace::YCbCrNative;
+    config.chroma_format = chroma;
+    config.normalize_for_chroma();
+}
+
+/// A Y4M writer for VMAF's reference and distorted streams, in whichever colour space the frames
+/// handed to it are in. `native` is LOSSLESS-5's arm: the frames already are Y'CbCr and the
+/// writer's BT.601 matrix must not run on them.
+fn y4m_writer(
+    path: &str,
+    width: usize,
+    height: usize,
+    fps_num: u32,
+    fps_den: u32,
+    native: bool,
+) -> Y4mWriter {
+    let mut w = Y4mWriter::create(path, width, height, fps_num, fps_den);
+    w.native = native;
+    w
+}
+
 /// Run the `vmaf` CLI on two Y4M files and return (mean, min, max) VMAF scores.
 fn run_vmaf(reference: &str, distorted: &str) -> Option<(f64, f64, f64)> {
     let tmp_json = format!("{}.json", distorted);
     let status = std::process::Command::new("vmaf")
         .args([
-            "--reference", reference,
-            "--distorted", distorted,
+            "--reference",
+            reference,
+            "--distorted",
+            distorted,
             "--json",
-            "--output", &tmp_json,
+            "--output",
+            &tmp_json,
             "--quiet",
         ])
         .status();
@@ -311,8 +482,8 @@ fn run_vmaf(reference: &str, distorted: &str) -> Option<(f64, f64, f64)> {
     let _ = std::fs::remove_file(&tmp_json);
     let json: serde_json::Value = serde_json::from_str(&json_str).ok()?;
     let mean = json["pooled_metrics"]["vmaf"]["mean"].as_f64()?;
-    let min  = json["pooled_metrics"]["vmaf"]["min"].as_f64()?;
-    let max  = json["pooled_metrics"]["vmaf"]["max"].as_f64()?;
+    let min = json["pooled_metrics"]["vmaf"]["min"].as_f64()?;
+    let max = json["pooled_metrics"]["vmaf"]["max"].as_f64()?;
     Some((mean, min, max))
 }
 
@@ -416,6 +587,83 @@ enum Command {
     /// Names printed here are what `GNC_GPU_ADAPTER` matches against (substring,
     /// case-insensitive), so this is the first command to run on a new machine.
     GpuInfo,
+
+    /// PERF-4 / MEAS-5: N concurrent encode streams inside **one process**.
+    ///
+    /// `scripts/gpu_tier_bench.py --density-still` answers the same question by launching N
+    /// copies of this binary, so every instance pays its own device creation, its own shader
+    /// compilation and its own buffers. Two machines then agreed on ~1.7-1.85x from N=4 while
+    /// the GPU drew 2-49 W — an overhead ceiling, not a compute one. This subcommand removes
+    /// the duplication that measurement was dominated by, and keeps a control that puts it
+    /// back one layer at a time:
+    ///
+    /// * default — one `GpuContext`, N streams, N sets of pipelines and buffers;
+    /// * `--per-stream-device` — N devices in one process (what N processes do, minus the
+    ///   process);
+    /// * `--serial` — the same total frames through one stream, so the aggregate row has a
+    ///   same-binary 1x to divide by.
+    ///
+    /// Steady state is timed on its own, behind a barrier, after every stream has built its
+    /// pipelines and encoded a warm-up frame — the setup cost is reported separately rather
+    /// than folded into the frame rate.
+    Density {
+        /// Input image file (a still; this loops one frame, like `--density-still`)
+        #[arg(short, long)]
+        input: String,
+
+        /// Encode iterations **per stream** in the timed window
+        #[arg(short = 'n', long, default_value = "24")]
+        iterations: u32,
+
+        /// Quality preset (1-100)
+        #[arg(short = 'q', long, default_value = "90")]
+        quality: u32,
+
+        /// Number of concurrent streams in this process
+        #[arg(long, default_value = "1")]
+        streams: u32,
+
+        /// Give every stream its own device instead of sharing one. The control for
+        /// "is the ceiling the device, or the process?"
+        #[arg(long)]
+        per_stream_device: bool,
+
+        /// Run the same total frame count through a single stream. The same-binary 1x.
+        #[arg(long)]
+        serial: bool,
+
+        /// Decode each encoded frame too, so the row covers a round trip rather than encode only
+        #[arg(long)]
+        decode: bool,
+
+        /// Use the abac entropy coder
+        #[arg(long)]
+        abac: bool,
+
+        /// Chroma subsampling format: 444 (default), 422, or 420
+        #[arg(long, default_value = "444")]
+        chroma_format: String,
+
+        /// Emit the summary as one JSON object on stdout, for a harness to collect
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print a behavioural fingerprint of this binary's encoder: what it *produces*, not what it is.
+    ///
+    /// **COORD-6.** Five of the seven recorded measurement failures in this repository are one
+    /// session's table decaying because `main` moved under it, so its early rows and late rows come
+    /// from different codecs. Nothing errors; the numbers are simply from two encoders and read as
+    /// one. `shasum` of the binary cannot help — it changes when a doc comment does — and a
+    /// claim-time commit stamp caught 1 of 6 (COORD-4).
+    ///
+    /// This runs the only honest test there is, output equality, on a pinned matrix small enough to
+    /// be free: print it beside a number and any later reader can tell whether two tables are
+    /// comparable. Print it before *and* after a sweep and a mid-run rebuild becomes visible.
+    Fingerprint {
+        /// Print each configuration's own digest and coded size.
+        #[arg(long)]
+        verbose: bool,
+    },
 
     /// Run encode-decode benchmark on an image
     Benchmark {
@@ -763,7 +1011,10 @@ enum Command {
         dir: String,
 
         /// Comma-separated sequence names (default: rush_hour,crowd_run,stockholm,park_joy,bbb_2min)
-        #[arg(long, default_value = "rush_hour,crowd_run,stockholm,park_joy,bbb_2min")]
+        #[arg(
+            long,
+            default_value = "rush_hour,crowd_run,stockholm,park_joy,bbb_2min"
+        )]
         sequences: String,
 
         /// Max frames per sequence (0 = all)
@@ -903,6 +1154,285 @@ fn csv_with_suffix(path: &str, suffix: &str) -> String {
     }
 }
 
+/// Parameters of one `density` run. A struct rather than ten positional arguments,
+/// because the two boolean control flags are the point of the command and are easy
+/// to transpose.
+struct DensityArgs {
+    input: String,
+    iterations: u32,
+    quality: u32,
+    streams: u32,
+    per_stream_device: bool,
+    serial: bool,
+    decode: bool,
+    abac: bool,
+    chroma_format: String,
+    json: bool,
+}
+
+/// What one stream reports back. Every duration is measured inside the stream's own
+/// thread, so the setup columns are per stream and genuinely concurrent, not a sum.
+struct StreamTiming {
+    stream: u32,
+    device_ms: f64,
+    pipeline_ms: f64,
+    warmup_ms: f64,
+    /// When this stream left the barrier, relative to the run's start.
+    start_s: f64,
+    /// When this stream finished its last iteration, relative to the run's start.
+    end_s: f64,
+    frames: u32,
+    bytes: usize,
+}
+
+/// PERF-4: N concurrent streams in one process, with the device shared or not.
+///
+/// The measurement the process-per-stream sweep cannot make. It is timed in two parts on
+/// purpose: `setup` is everything paid once per stream (device, pipelines, first frame) and
+/// `steady` is the timed window behind a barrier. Folding the two together is what made
+/// `--density-still` report a 15-second pipeline compilation as a frame rate.
+fn run_density(args: DensityArgs) {
+    use std::sync::Barrier;
+    use std::time::Instant;
+
+    let DensityArgs {
+        input,
+        iterations,
+        quality,
+        streams,
+        per_stream_device,
+        serial,
+        decode,
+        abac,
+        chroma_format,
+        json,
+    } = args;
+
+    let streams = streams.max(1);
+    // `--serial` puts the same total work through one stream, so the aggregate row has a
+    // 1x from this binary rather than from a different harness.
+    let (n_threads, per_thread_iters) = if serial {
+        (1u32, streams * iterations)
+    } else {
+        (streams, iterations)
+    };
+
+    let load_start = Instant::now();
+    let (rgb_data, w, h) = load_image_rgb_f32_bits(&input, 8);
+    let load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
+    let rgb_data = Arc::new(rgb_data);
+
+    let mut config = gnc::quality_preset(quality);
+    if abac {
+        config.entropy_coder = gnc::EntropyCoder::Abac;
+    }
+    config.chroma_format = parse_chroma_format(&chroma_format);
+    config.normalize_for_chroma();
+
+    // One device, or one per stream. Built before the threads start either way, so the
+    // shared device is not itself inside the timed window.
+    let shared_start = Instant::now();
+    let shared_ctx: Option<Arc<GpuContext>> = if per_stream_device {
+        None
+    } else {
+        Some(Arc::new(GpuContext::new()))
+    };
+    let shared_device_ms = shared_start.elapsed().as_secs_f64() * 1000.0;
+
+    let adapter_name = shared_ctx
+        .as_ref()
+        .map(|c| gnc::describe_adapter(&c.adapter.get_info()));
+
+    if !json {
+        println!(
+            "density: {}x{} q={} {} stream(s) x {} iterations, {} device(s), {}",
+            w,
+            h,
+            quality,
+            n_threads,
+            per_thread_iters,
+            if per_stream_device { n_threads } else { 1 },
+            if decode { "encode+decode" } else { "encode" }
+        );
+        if let Some(name) = &adapter_name {
+            println!("  device: {}", name);
+        }
+    }
+
+    let barrier = Barrier::new(n_threads as usize);
+    let run_start = Instant::now();
+
+    let timings: Vec<StreamTiming> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..n_threads)
+            .map(|stream| {
+                let barrier = &barrier;
+                let rgb = Arc::clone(&rgb_data);
+                let config = config.clone();
+                let shared = shared_ctx.clone();
+                scope.spawn(move || {
+                    // Each stream's own device, or a handle on the shared one.
+                    let dev_start = Instant::now();
+                    let owned;
+                    let ctx: &GpuContext = match &shared {
+                        Some(c) => c,
+                        None => {
+                            owned = GpuContext::new();
+                            &owned
+                        }
+                    };
+                    let device_ms = dev_start.elapsed().as_secs_f64() * 1000.0;
+
+                    // Pipelines are per stream even when the device is shared: they own the
+                    // mutable buffer cache, which is stream state, not program state.
+                    let pipe_start = Instant::now();
+                    let mut encoder = EncoderPipeline::new(ctx);
+                    let decoder = decode.then(|| DecoderPipeline::new(ctx));
+                    let pipeline_ms = pipe_start.elapsed().as_secs_f64() * 1000.0;
+
+                    // Warm-up. First-frame cost is buffer allocation and driver warm-up, and
+                    // it belongs in setup rather than in the frame rate.
+                    let warm_start = Instant::now();
+                    let warm = encoder.encode(ctx, &rgb, w, h, &config);
+                    if let Some(d) = &decoder {
+                        let _ = d.decode_u8(ctx, &warm);
+                    }
+                    let warmup_ms = warm_start.elapsed().as_secs_f64() * 1000.0;
+
+                    barrier.wait();
+
+                    let start_s = run_start.elapsed().as_secs_f64();
+                    let mut bytes = 0usize;
+                    for _ in 0..per_thread_iters {
+                        let compressed = encoder.encode(ctx, &rgb, w, h, &config);
+                        bytes += compressed.byte_size();
+                        if let Some(d) = &decoder {
+                            let px = d.decode_u8(ctx, &compressed);
+                            std::hint::black_box(&px);
+                        }
+                    }
+                    let end_s = run_start.elapsed().as_secs_f64();
+
+                    StreamTiming {
+                        stream,
+                        device_ms,
+                        pipeline_ms,
+                        warmup_ms,
+                        start_s,
+                        end_s,
+                        frames: per_thread_iters,
+                        bytes,
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("density stream panicked"))
+            .collect()
+    });
+
+    // The timed window runs from the last stream leaving the barrier to the last stream
+    // finishing. Taking the *max* start is deliberate: the barrier releases within
+    // microseconds, and using the min would credit the aggregate with time no stream
+    // could have used.
+    let window_start = timings.iter().map(|t| t.start_s).fold(f64::MIN, f64::max);
+    let window_end = timings.iter().map(|t| t.end_s).fold(f64::MIN, f64::max);
+    let steady_s = (window_end - window_start).max(f64::EPSILON);
+    let total_frames: u32 = timings.iter().map(|t| t.frames).sum();
+    let aggregate_fps = total_frames as f64 / steady_s;
+    let per_stream_fps = aggregate_fps / n_threads as f64;
+
+    let setup_ms: f64 = timings
+        .iter()
+        .map(|t| t.device_ms + t.pipeline_ms + t.warmup_ms)
+        .fold(0.0, f64::max);
+
+    if json {
+        let per_stream: Vec<String> = timings
+            .iter()
+            .map(|t| {
+                format!(
+                    "{{\"stream\":{},\"device_ms\":{:.1},\"pipeline_ms\":{:.1},\
+                     \"warmup_ms\":{:.1},\"frames\":{},\"bytes\":{},\"seconds\":{:.3}}}",
+                    t.stream,
+                    t.device_ms,
+                    t.pipeline_ms,
+                    t.warmup_ms,
+                    t.frames,
+                    t.bytes,
+                    t.end_s - t.start_s
+                )
+            })
+            .collect();
+        println!(
+            "{{\"streams\":{},\"iterations\":{},\"quality\":{},\"shared_device\":{},\
+             \"serial\":{},\"decode\":{},\"width\":{},\"height\":{},\"total_frames\":{},\
+             \"steady_s\":{:.3},\"aggregate_fps\":{:.2},\"per_stream_fps\":{:.2},\
+             \"setup_ms_max\":{:.1},\"shared_device_ms\":{:.1},\"load_ms\":{:.1},\
+             \"per_stream\":[{}]}}",
+            n_threads,
+            per_thread_iters,
+            quality,
+            !per_stream_device,
+            serial,
+            decode,
+            w,
+            h,
+            total_frames,
+            steady_s,
+            aggregate_fps,
+            per_stream_fps,
+            setup_ms,
+            shared_device_ms,
+            load_ms,
+            per_stream.join(",")
+        );
+        return;
+    }
+
+    // The canary: per-stream rows prove N streams ran and each did its own frames.
+    // A run that silently collapsed to one stream is visible here and nowhere else.
+    println!(
+        "\n  {:>6} {:>10} {:>10} {:>10} {:>8} {:>9} {:>10}",
+        "stream", "device ms", "pipe ms", "warmup ms", "frames", "seconds", "fps"
+    );
+    for t in &timings {
+        let secs = (t.end_s - t.start_s).max(f64::EPSILON);
+        println!(
+            "  {:>6} {:>10.1} {:>10.1} {:>10.1} {:>8} {:>9.3} {:>10.2}",
+            t.stream,
+            t.device_ms,
+            t.pipeline_ms,
+            t.warmup_ms,
+            t.frames,
+            secs,
+            t.frames as f64 / secs
+        );
+    }
+    println!(
+        "\n  image load           {:>8.1} ms (once for the process; N processes pay it N times)",
+        load_ms
+    );
+    if !per_stream_device {
+        println!(
+            "  shared device        {:>8.1} ms (once for the process)",
+            shared_device_ms
+        );
+    }
+    println!(
+        "  setup, worst stream  {:>8.1} ms (device + pipelines + first frame)",
+        setup_ms
+    );
+    println!(
+        "  steady window        {:>8.3} s for {} frames",
+        steady_s, total_frames
+    );
+    println!(
+        "  aggregate            {:>8.2} fps   ({:.2} fps per stream)",
+        aggregate_fps, per_stream_fps
+    );
+}
+
 /// Build a `CodecConfig` from the common CLI parameters shared by both the
 /// streaming and non-streaming I+P+B encode paths.
 // Every parameter comes directly from CLI args; a builder struct would be
@@ -949,7 +1479,7 @@ fn build_ip_config(
         config.entropy_coder = gnc::EntropyCoder::Abac;
     }
     config.chroma_format = parse_chroma_format(chroma_format);
-            config.normalize_for_chroma();
+    config.normalize_for_chroma();
     if let Some(ref br) = bitrate {
         config.target_bitrate = Some(parse_bitrate(br));
         config.rate_mode = parse_rate_mode(rate_mode);
@@ -978,7 +1508,7 @@ impl StreamingY4m {
     fn load(&mut self, i: usize) -> Arc<Vec<f32>> {
         // Advance reader to cover frame i
         while self.next_pos <= i && self.next_pos < self.frame_count {
-            if let Some(rgb) = self.reader.read_frame_rgb() {
+            if let Some(rgb) = self.reader.read_frame_interleaved() {
                 self.cache[self.next_pos] = Some(Arc::new(rgb));
                 self.next_pos += 1;
             } else {
@@ -1048,7 +1578,33 @@ fn main() {
             chroma_format,
             bit_depth,
         } => {
-            let (rgb_data, w, h) = load_image_rgb_f32_bits(&input, bit_depth);
+            // **LOSSLESS-4.** A Y4M source is read as its own planes and coded as they are.
+            // The old path ran BT.601 first, which cannot be undone — the matrix is not
+            // integer-invertible, so the file's samples could never come back — and costs 39.2%
+            // more bits. `GNC_RGB_PATH=1` forces the old behaviour, which is what an A/B needs.
+            let force_rgb = std::env::var("GNC_RGB_PATH")
+                .map(|v| v != "0")
+                .unwrap_or(false);
+            let y4m_planes = if input.ends_with(".y4m") && !force_rgb {
+                let mut r = Y4mReader::open(&input);
+                let (yw, yh, cf) = (r.width, r.height, r.chroma_format());
+                let p = r.read_frame_planes().expect("Y4M file has no frames");
+                Some((p, yw, yh, cf))
+            } else {
+                None
+            };
+            let (rgb_data, w, h) = match &y4m_planes {
+                Some((_, yw, yh, _)) => (Vec::new(), *yw, *yh),
+                // `gnc encode` never read Y4M before, so the forced-RGB arm has to do the
+                // conversion itself. Without this the A/B the flag exists for cannot run at all:
+                // the image loader refuses the extension and the comparison silently has one arm.
+                None if input.ends_with(".y4m") => {
+                    let mut r = Y4mReader::open(&input);
+                    let (yw, yh) = (r.width, r.height);
+                    (r.read_frame_rgb().expect("Y4M file has no frames"), yw, yh)
+                }
+                None => load_image_rgb_f32_bits(&input, bit_depth),
+            };
             println!("Input: {}x{} ({} pixels)", w, h, w * h);
 
             let ctx = GpuContext::new();
@@ -1099,11 +1655,26 @@ fn main() {
             if cpu_encode {
                 config.gpu_entropy_encode = false;
             }
-            config.chroma_format = parse_chroma_format(&chroma_format);
+            // A Y4M file's chroma format is a property of the file, not a request: coding its
+            // planes at any other sampling would mean resampling them, which is the cost this
+            // path exists to avoid.
+            config.chroma_format = match &y4m_planes {
+                Some((_, _, _, cf)) => *cf,
+                None => parse_chroma_format(&chroma_format),
+            };
             config.normalize_for_chroma();
             config.bit_depth = bit_depth;
 
-            let compressed = encoder.encode(&ctx, &rgb_data, w, h, &config);
+            let compressed = match &y4m_planes {
+                Some(((y, cb, cr), _, _, _)) => {
+                    eprintln!(
+                        "GNC: Y4M source — coding its own Y'CbCr planes, no colour conversion \
+(LOSSLESS-4). GNC_RGB_PATH=1 for the old behaviour."
+                    );
+                    encoder.encode_planar(&ctx, y, cb, cr, w, h, &config)
+                }
+                None => encoder.encode(&ctx, &rgb_data, w, h, &config),
+            };
             println!(
                 "Compressed: {} bytes ({:.2} bpp)",
                 compressed.byte_size(),
@@ -1131,7 +1702,30 @@ fn main() {
             let ctx = GpuContext::new();
             let decoder = DecoderPipeline::new(&ctx);
 
-            let rgb_data = decoder.decode(&ctx, &compressed);
+            let decoded = decoder.decode(&ctx, &compressed);
+            // **LOSSLESS-4 / GP21.** A native file decodes to its own Y'CbCr planes, which a PNG
+            // cannot hold — so writing one means converting, and that conversion is the lossy
+            // step the coding path no longer has. Said out loud rather than done quietly: the
+            // whole point of the native path is that the samples survive, and they survive into
+            // a `.y4m` output, not into a PNG.
+            let rgb_data = if compressed.config.color_space == gnc::ColorSpace::YCbCrNative {
+                eprintln!(
+                    "GNC: this file holds Y'CbCr; converting to RGB for image output. The samples \
+survive only into a Y4M output (LOSSLESS-4)."
+                );
+                let mut out = vec![0.0f32; decoded.len()];
+                for p in 0..decoded.len() / 3 {
+                    let yy = 1.164_f32 * (decoded[p * 3] - 16.0);
+                    let pb = decoded[p * 3 + 1] - 128.0;
+                    let pr = decoded[p * 3 + 2] - 128.0;
+                    out[p * 3] = (yy + 1.596 * pr).clamp(0.0, 255.0);
+                    out[p * 3 + 1] = (yy - 0.392 * pb - 0.813 * pr).clamp(0.0, 255.0);
+                    out[p * 3 + 2] = (yy + 2.017 * pb).clamp(0.0, 255.0);
+                }
+                out
+            } else {
+                decoded
+            };
             // Write at the bit depth the frame was coded at. Writing 8-bit unconditionally threw
             // away the extra precision a 10-bit encode had just preserved, which made the 10-bit
             // path pointless end to end (MEAS-8: 8-bit is what limits colour fidelity, not the
@@ -1146,6 +1740,33 @@ fn main() {
             println!("Decoded to {}", output);
         }
 
+        Command::Fingerprint { verbose } => {
+            let ctx = pollster::block_on(gnc::GpuContext::try_new_async()).expect(
+                "no GPU adapter; a fingerprint describes an encoder, so there is no meaningful \
+                 answer without one",
+            );
+            let fp = gnc::fingerprint::compute(&ctx);
+            if verbose {
+                for row in &fp.rows {
+                    println!(
+                        "  {:<24} {:>9} B  {:08x}  {}",
+                        row.name, row.bytes, row.crc, row.composition
+                    );
+                }
+            }
+            println!(
+                "codec-fingerprint {} {:08x}  ({} configurations)",
+                gnc::fingerprint::MATRIX_VERSION,
+                fp.digest,
+                fp.rows.len(),
+            );
+            println!(
+                "  This is what the encoder PRODUCES on a pinned matrix, so two numbers carrying \
+                 the same\n  fingerprint are comparable and two carrying different ones are not. \
+                 It does not cover\n  every path: a change that moves output only outside the \
+                 matrix will not show here."
+            );
+        }
         Command::GpuInfo => {
             let adapters = gnc::list_adapters();
             if adapters.is_empty() {
@@ -1173,7 +1794,10 @@ fn main() {
                         // the one named override (BUG-34, docs/decisions/0047).
                         let have = ctx.adapter.limits();
                         let used = ctx.device.limits();
-                        println!("\nDevice in use: {}", gnc::describe_adapter(&ctx.adapter.get_info()));
+                        println!(
+                            "\nDevice in use: {}",
+                            gnc::describe_adapter(&ctx.adapter.get_info())
+                        );
                         println!("{:<26}{:>12} {:>12}", "", "adapter has", "GNC requests");
                         let row = |name: &str, h: u32, u: u32| {
                             println!("  {name:<24}{h:>12} {u:>12}");
@@ -1223,6 +1847,32 @@ fn main() {
                     Err(e) => println!("\nCould not open a device to report limits: {e}"),
                 }
             }
+        }
+
+        Command::Density {
+            input,
+            iterations,
+            quality,
+            streams,
+            per_stream_device,
+            serial,
+            decode,
+            abac,
+            chroma_format,
+            json,
+        } => {
+            run_density(DensityArgs {
+                input,
+                iterations,
+                quality,
+                streams,
+                per_stream_device,
+                serial,
+                decode,
+                abac,
+                chroma_format,
+                json,
+            });
         }
 
         Command::Benchmark {
@@ -1386,32 +2036,40 @@ fn main() {
                     // As fraction of mean bpp:
                     let pcrd_estimate_frac = (1.0 + cv * cv).log2() * 0.5 / mean.log2();
 
-                    eprintln!("[tile_bpp] Y tiles={} tile_size={}",
-                        y_tile_count, ts);
+                    eprintln!("[tile_bpp] Y tiles={} tile_size={}", y_tile_count, ts);
                     eprintln!("[tile_bpp] mean={:.3} std={:.3} CV={:.3}  min={:.3} max={:.3} max/min={:.1}×",
                         mean, std_dev, cv, min_bpp, max_bpp, ratio);
-                    eprintln!("[tile_bpp] PCRD upper-bound estimate: {:.1}% bpp reduction",
-                        pcrd_estimate_frac * 100.0);
+                    eprintln!(
+                        "[tile_bpp] PCRD upper-bound estimate: {:.1}% bpp reduction",
+                        pcrd_estimate_frac * 100.0
+                    );
 
                     // Print all per-tile bpp values
                     for (i, &bpp) in tile_bpps.iter().enumerate() {
                         let tx = i % tiles_x_u;
                         let ty = i / tiles_x_u;
-                        eprintln!("[tile_bpp]   tile({:2},{:2}) = {:.3} bpp  ({:.0}%)",
-                            tx, ty, bpp, bpp / mean * 100.0);
+                        eprintln!(
+                            "[tile_bpp]   tile({:2},{:2}) = {:.3} bpp  ({:.0}%)",
+                            tx,
+                            ty,
+                            bpp,
+                            bpp / mean * 100.0
+                        );
                     }
                 }
             }
 
             // VMAF perceptual quality scoring (single-frame)
             if vmaf {
-                let tmp_ref  = gnc::session_temp_path("gnc_bench_vmaf_ref.y4m");
+                let tmp_ref = gnc::session_temp_path("gnc_bench_vmaf_ref.y4m");
                 let tmp_dist = gnc::session_temp_path("gnc_bench_vmaf_dist.y4m");
                 {
-                    let mut ref_wr = Y4mWriter::create(tmp_ref.to_str().unwrap(), w as usize, h as usize, 1, 1);
+                    let mut ref_wr =
+                        Y4mWriter::create(tmp_ref.to_str().unwrap(), w as usize, h as usize, 1, 1);
                     ref_wr.write_frame(&rgb_data);
                     ref_wr.flush();
-                    let mut dist_wr = Y4mWriter::create(tmp_dist.to_str().unwrap(), w as usize, h as usize, 1, 1);
+                    let mut dist_wr =
+                        Y4mWriter::create(tmp_dist.to_str().unwrap(), w as usize, h as usize, 1, 1);
                     dist_wr.write_frame(&reconstructed);
                     dist_wr.flush();
                 }
@@ -1611,6 +2269,58 @@ fn main() {
                 input, num_frames, keyframe_interval, qstep_display, rc_display
             );
 
+            // **LOSSLESS-5.** A Y4M sequence is coded in its own colour space and its own chroma
+            // format, the way LOSSLESS-4 already codes a Y4M still. The source's chroma format
+            // comes out of the header and overrides `--chroma-format`, because at this point the
+            // flag would be a request to *resample* the file.
+            //
+            // **Gated on a lossless request, unlike the still path, and that asymmetry is
+            // deliberate.** At `q=100` the two arms decode the same picture — the native one
+            // exactly, so the comparison is bytes alone and there is nothing for CLAUDE.md's
+            // metric table to arbitrate. Below it the change is a rate/quality trade in a
+            // different colour space: the subband weights and the CfL range were tuned on
+            // YCoCg-R, VMAF cannot see the chroma half of what moves, and a luma PSNR computed
+            // in two different spaces is not a comparison. That measurement has not been made,
+            // so the lossy default stays where it was. `LOSSLESS-6` is the item.
+            let lossless_request = {
+                let mut c = if let Some(q) = quality {
+                    gnc::quality_preset(q)
+                } else {
+                    gnc::manual_config(qstep.unwrap_or(4.0))
+                };
+                if let Some(qs) = qstep {
+                    c.quantization_step = qs;
+                }
+                c.is_lossless()
+            };
+            let is_y4m = input.ends_with(".y4m");
+            let y4m_native = is_y4m && lossless_request && y4m_native_path();
+            let source_chroma = if is_y4m {
+                Some(Y4mReader::open(&input).chroma_format())
+            } else {
+                None
+            };
+            // The canary (CLAUDE.md, "no silent features"): it prints on every Y4M input and says
+            // which arm ran, so "the native path was taken" is distinguishable from "the native
+            // path was never reached" and from each of the two reasons it can be refused.
+            if y4m_native {
+                eprintln!(
+                    "GNC: Y4M sequence — coding its own {:?} Y'CbCr, no colour conversion at \
+either end (LOSSLESS-5). GNC_RGB_PATH=1 for the old behaviour.",
+                    source_chroma.unwrap(),
+                );
+            } else if is_y4m && !lossless_request {
+                eprintln!(
+                    "GNC: Y4M sequence — lossy request, converting to RGB with BT.601 first. \
+The native colour space is measured at q=100 only (LOSSLESS-5); below it the trade is unmeasured."
+                );
+            } else if is_y4m {
+                eprintln!(
+                    "GNC: Y4M sequence — GNC_RGB_PATH=1, converting to RGB with BT.601 first \
+(the pre-LOSSLESS-5 arm)."
+                );
+            }
+
             let ctx = GpuContext::new();
             let mut encoder = EncoderPipeline::new(&ctx);
             let decoder = DecoderPipeline::new(&ctx);
@@ -1652,11 +2362,11 @@ fn main() {
                 // For Y4M we keep the reader open so we can reuse it for warmup frames,
                 // avoiding a separate probe-only open.
                 let (w, h, y4m_fps, y4m_probe_reader) = if use_y4m {
-                    let probe = Y4mReader::open(&input);
+                    let mut probe = Y4mReader::open(&input);
+                    probe.native = y4m_native;
                     let fw = probe.width;
                     let fh = probe.height;
-                    let y4m_fps_val =
-                        probe.fps_num as f64 / probe.fps_den.max(1) as f64;
+                    let y4m_fps_val = probe.fps_num as f64 / probe.fps_den.max(1) as f64;
                     (fw, fh, Some(y4m_fps_val), Some(probe))
                 } else {
                     let first_path = input.replace("%04d", &format!("{:04}", 0));
@@ -1700,7 +2410,10 @@ fn main() {
                     config_tw.entropy_coder = gnc::EntropyCoder::Abac;
                 }
                 config_tw.chroma_format = parse_chroma_format(&chroma_format);
-            config_tw.normalize_for_chroma();
+                config_tw.normalize_for_chroma();
+                if y4m_native {
+                    use_source_colour(&mut config_tw, source_chroma.unwrap());
+                }
                 println!(
                     "\n=== Temporal wavelet ({:?}, streaming, {}) ===",
                     temporal_mode,
@@ -1711,8 +2424,14 @@ fn main() {
                 }
                 println!(
                     "Temporal config: qstep {:.3}, dead_zone {:.3}, entropy {:?}, adaptive_mul {}",
-                    config_tw.quantization_step, config_tw.dead_zone, config_tw.entropy_coder,
-                    if config_tw.adaptive_temporal_mul { "on" } else { "off" },
+                    config_tw.quantization_step,
+                    config_tw.dead_zone,
+                    config_tw.entropy_coder,
+                    if config_tw.adaptive_temporal_mul {
+                        "on"
+                    } else {
+                        "off"
+                    },
                 );
 
                 // ---------------------------------------------------------------------------
@@ -1736,7 +2455,7 @@ fn main() {
                 // is a separate, independent open that always restarts from frame 0.
                 let warmup_frames: Vec<Vec<f32>> = if let Some(mut y4m_warmup) = y4m_probe_reader {
                     (0..gop_size)
-                        .filter_map(|_| y4m_warmup.read_frame_rgb())
+                        .filter_map(|_| y4m_warmup.read_frame_interleaved())
                         .collect()
                 } else {
                     (0..gop_size)
@@ -1753,8 +2472,7 @@ fn main() {
 
                 // Step 2: temporal Haar warmup (warms shaders used in encode_temporal_wavelet_gop)
                 if warmup_frames.len() >= gop_size {
-                    let wf_refs: Vec<&[f32]> =
-                        warmup_frames.iter().map(|f| f.as_slice()).collect();
+                    let wf_refs: Vec<&[f32]> = warmup_frames.iter().map(|f| f.as_slice()).collect();
                     let _ = encoder.encode_temporal_wavelet_gop(
                         &ctx,
                         &wf_refs,
@@ -1784,7 +2502,9 @@ fn main() {
                 // For Y4M: open the file once and stream frames sequentially.
                 // For PNG: re-derive paths from the pattern per-GOP.
                 let mut y4m_stream: Option<Y4mReader> = if use_y4m {
-                    Some(Y4mReader::open(&input))
+                    let mut r = Y4mReader::open(&input);
+                    r.native = y4m_native;
+                    Some(r)
                 } else {
                     None
                 };
@@ -1807,20 +2527,28 @@ fn main() {
                 let mut diag_steady_fps: Vec<f64> = Vec::new(); // per-GOP fps, excl GOP 0 warmup
 
                 // VMAF Y4M writers: reference and distorted streams.
-                let tmp_ref  = gnc::session_temp_path("gnc_vmaf_ref.y4m");
+                let tmp_ref = gnc::session_temp_path("gnc_vmaf_ref.y4m");
                 let tmp_dist = gnc::session_temp_path("gnc_vmaf_dist.y4m");
                 let mut vmaf_ref_writer: Option<Y4mWriter> = if vmaf {
-                    Some(Y4mWriter::create(
-                        tmp_ref.to_str().unwrap(), w as usize, h as usize,
-                        (effective_fps * 1000.0) as u32, 1000,
+                    Some(y4m_writer(
+                        tmp_ref.to_str().unwrap(),
+                        w as usize,
+                        h as usize,
+                        (effective_fps * 1000.0) as u32,
+                        1000,
+                        y4m_native,
                     ))
                 } else {
                     None
                 };
                 let mut vmaf_dist_writer: Option<Y4mWriter> = if vmaf {
-                    Some(Y4mWriter::create(
-                        tmp_dist.to_str().unwrap(), w as usize, h as usize,
-                        (effective_fps * 1000.0) as u32, 1000,
+                    Some(y4m_writer(
+                        tmp_dist.to_str().unwrap(),
+                        w as usize,
+                        h as usize,
+                        (effective_fps * 1000.0) as u32,
+                        1000,
+                        y4m_native,
                     ))
                 } else {
                     None
@@ -1842,13 +2570,14 @@ fn main() {
                     let base = gop_idx * gop_size;
                     // Load this GOP's frames (or use pre-loaded lookahead from previous iteration)
                     let t_io_start = std::time::Instant::now();
-                    let gop_frames: Vec<Vec<f32>> = if let Some(preloaded) = lookahead_frames.take() {
+                    let gop_frames: Vec<Vec<f32>> = if let Some(preloaded) = lookahead_frames.take()
+                    {
                         preloaded // skip I/O; already loaded in previous iteration's lookahead
                     } else {
                         let mut frames = Vec::with_capacity(gop_size);
                         if let Some(ref mut y4m) = y4m_stream {
                             for _ in 0..gop_size {
-                                match y4m.read_frame_rgb() {
+                                match y4m.read_frame_interleaved() {
                                     Some(rgb) => frames.push(rgb),
                                     None => break,
                                 }
@@ -1868,7 +2597,9 @@ fn main() {
                     if gop_frames.len() < gop_size {
                         eprintln!(
                             "  Warning: Y4M EOF at GOP {}, only {} frames (expected {}). Stopping.",
-                            gop_idx, gop_frames.len(), gop_size
+                            gop_idx,
+                            gop_frames.len(),
+                            gop_size
                         );
                         break;
                     }
@@ -1917,7 +2648,7 @@ fn main() {
                         let mut next_frames = Vec::with_capacity(gop_size);
                         if let Some(ref mut y4m) = y4m_stream {
                             for _ in 0..gop_size {
-                                match y4m.read_frame_rgb() {
+                                match y4m.read_frame_interleaved() {
                                     Some(rgb) => next_frames.push(rgb),
                                     None => break,
                                 }
@@ -1936,7 +2667,8 @@ fn main() {
                     }
 
                     let gop_refs: Vec<&[f32]> = gop_frames.iter().map(|f| f.as_slice()).collect();
-                    let next_refs: Option<Vec<&[f32]>> = lookahead_frames.as_ref()
+                    let next_refs: Option<Vec<&[f32]>> = lookahead_frames
+                        .as_ref()
                         .map(|v| v.iter().map(|f| f.as_slice()).collect());
 
                     // Rate control: set qstep from RC estimate if active.
@@ -1958,7 +2690,9 @@ fn main() {
                     total_enc_ms += gop_enc_ms;
 
                     let low_bytes = group.low_frame.byte_size();
-                    let high_bytes: usize = group.high_frames.iter()
+                    let high_bytes: usize = group
+                        .high_frames
+                        .iter()
                         .flat_map(|lvl| lvl.iter())
                         .map(|f| f.byte_size())
                         .sum();
@@ -1967,10 +2701,12 @@ fn main() {
 
                     // Rate control: update model with actual GOP size.
                     if let Some(rc) = &mut rc_opt {
-                        let n_frames = (group.high_frames.iter().map(|l| l.len()).sum::<usize>() + 1) as u32;
+                        let n_frames =
+                            (group.high_frames.iter().map(|l| l.len()).sum::<usize>() + 1) as u32;
                         rc.update_gop(config_tw.quantization_step, group_bytes, n_frames);
-                        let target_bytes = (config_tw.target_bitrate.unwrap_or(0.0)
-                            / effective_fps * n_frames as f64 / 8.0) as usize;
+                        let target_bytes = (config_tw.target_bitrate.unwrap_or(0.0) / effective_fps
+                            * n_frames as f64
+                            / 8.0) as usize;
                         eprintln!(
                             "[RC] gop={gop_idx} target={target_bytes}B actual={group_bytes}B fill={:.1}% q={:.2}",
                             rc.vbv_fill_ratio() * 100.0,
@@ -2043,9 +2779,11 @@ fn main() {
                         // Full per-GOP diagnostics (decomposition, coefficients, warnings).
                         if gnc::encoder::diagnostics::enabled() {
                             let q = quality.unwrap_or(75);
-                            let mul = tw_highpass_mul.unwrap_or(config_tw.temporal_highpass_qstep_mul);
+                            let mul =
+                                tw_highpass_mul.unwrap_or(config_tw.temporal_highpass_qstep_mul);
                             let tw_peak = max_val_for_depth(config_tw.bit_depth) as f32;
-                            let per_frame_q: Vec<(f64, f64)> = gop_frames.iter()
+                            let per_frame_q: Vec<(f64, f64)> = gop_frames
+                                .iter()
                                 .zip(decoded_frames.iter())
                                 .map(|(orig, dec_frame)| {
                                     let psnr = quality::psnr(orig, dec_frame, tw_peak);
@@ -2054,7 +2792,9 @@ fn main() {
                                 })
                                 .collect();
                             for &(psnr, _) in &per_frame_q {
-                                if psnr.is_finite() { diag_psnr_vals.push(psnr); }
+                                if psnr.is_finite() {
+                                    diag_psnr_vals.push(psnr);
+                                }
                             }
                             gnc::encoder::diagnostics::print_temporal_gop_diagnostics(
                                 gop_idx,
@@ -2085,7 +2825,7 @@ fn main() {
                 for i in tail_start..num_frames {
                     let t_io_start = std::time::Instant::now();
                     let rgb = if let Some(ref mut y4m) = y4m_stream {
-                        match y4m.read_frame_rgb() {
+                        match y4m.read_frame_interleaved() {
                             Some(f) => f,
                             None => break,
                         }
@@ -2121,7 +2861,8 @@ fn main() {
                         enc_fps, num_frames, total_enc_ms,
                     );
                 }
-                let avg_bpp = (total_bytes as f64 * 8.0) / (w as f64 * h as f64) / num_frames as f64;
+                let avg_bpp =
+                    (total_bytes as f64 * 8.0) / (w as f64 * h as f64) / num_frames as f64;
                 println!(
                     "  Total: {} bytes ({:.2} MB), avg {:.2} bpp, {:.1}ms ({:.1} fps)",
                     total_bytes,
@@ -2164,8 +2905,12 @@ fn main() {
 
                 // VMAF scoring: flush Y4M streams, invoke vmaf CLI, report results.
                 if vmaf {
-                    if let Some(mut wr) = vmaf_ref_writer.take() { wr.flush(); }
-                    if let Some(mut wr) = vmaf_dist_writer.take() { wr.flush(); }
+                    if let Some(mut wr) = vmaf_ref_writer.take() {
+                        wr.flush();
+                    }
+                    if let Some(mut wr) = vmaf_dist_writer.take() {
+                        wr.flush();
+                    }
                     print!("  VMAF: computing... ");
                     use std::io::Write as _;
                     std::io::stdout().flush().ok();
@@ -2183,15 +2928,20 @@ fn main() {
 
                 // Diagnostics summary block — printed after all GOPs when --diagnostics is set
                 if diagnostics && !diag_psnr_vals.is_empty() {
-                    let mean_psnr = diag_psnr_vals.iter().sum::<f64>() / diag_psnr_vals.len() as f64;
+                    let mean_psnr =
+                        diag_psnr_vals.iter().sum::<f64>() / diag_psnr_vals.len() as f64;
                     let min_psnr = diag_psnr_vals.iter().cloned().fold(f64::INFINITY, f64::min);
-                    let max_psnr = diag_psnr_vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    let max_psnr = diag_psnr_vals
+                        .iter()
+                        .cloned()
+                        .fold(f64::NEG_INFINITY, f64::max);
                     let mean_enc_fps = if !diag_steady_fps.is_empty() {
                         diag_steady_fps.iter().sum::<f64>() / diag_steady_fps.len() as f64
                     } else {
                         0.0
                     };
-                    let avg_bpp = (total_bytes as f64 * 8.0) / (w as f64 * h as f64) / num_frames as f64;
+                    let avg_bpp =
+                        (total_bytes as f64 * 8.0) / (w as f64 * h as f64) / num_frames as f64;
                     eprintln!(
                         "\n=== Diagnostics Summary ===\n  frames={} GOPs={} avg_bpp={:.2}\n  psnr_avg={:.2} dB  psnr_min={:.2} dB  psnr_max={:.2} dB\n  enc_fps_steady={:.1} fps (excl GOP 0 warmup)",
                         num_frames, num_gops, avg_bpp, mean_psnr, min_psnr, max_psnr, mean_enc_fps,
@@ -2227,8 +2977,10 @@ fn main() {
                     &rate_mode,
                 );
                 config_ip.set_tile_size(tile_size);
-            config_ip.bit_depth = bit_depth;
                 config_ip.bit_depth = bit_depth;
+                if y4m_native {
+                    use_source_colour(&mut config_ip, source_chroma.unwrap());
+                }
 
                 let ki_window = config_ip.keyframe_interval as usize + 4;
                 let frame_size_mb = w as f64 * h as f64 * 3.0 * 4.0 / 1_048_576.0;
@@ -2240,7 +2992,11 @@ fn main() {
                 );
 
                 let mut streaming_y4m = StreamingY4m {
-                    reader: Y4mReader::open(&input),
+                    reader: {
+                        let mut r = Y4mReader::open(&input);
+                        r.native = y4m_native;
+                        r
+                    },
                     cache: vec![None; num_frames],
                     next_pos: 0,
                     released_up_to: 0,
@@ -2300,8 +3056,7 @@ fn main() {
                 if let Some(ref output_path) = output {
                     let fps_num = effective_fps.round() as u32;
                     let gnv1_data = serialize_sequence(&compressed_ip, (fps_num, 1));
-                    std::fs::write(output_path, &gnv1_data)
-                        .expect("Failed to write GNV1 output");
+                    std::fs::write(output_path, &gnv1_data).expect("Failed to write GNV1 output");
                     println!(
                         "\nGNV1 container written to {} ({} bytes)",
                         output_path,
@@ -2318,10 +3073,11 @@ fn main() {
             let mut h = 0u32;
             if input.ends_with(".y4m") {
                 let mut y4m = Y4mReader::open(&input);
+                y4m.native = y4m_native;
                 w = y4m.width;
                 h = y4m.height;
                 for _ in 0..num_frames {
-                    match y4m.read_frame_rgb() {
+                    match y4m.read_frame_interleaved() {
                         Some(rgb) => frames_data.push(rgb),
                         None => break,
                     }
@@ -2345,287 +3101,312 @@ fn main() {
             let mut frame_metrics_ip: Vec<FrameMetrics> = Vec::new();
 
             if run_baseline {
-            let mut frame_metrics_i: Vec<FrameMetrics> = Vec::new();
-            // --- I+P encoding ---
-            let mut config_ip = build_ip_config(
-                quality,
-                qstep,
-                keyframe_interval,
-                rans,
-                rice,
-                abac,
-                &chroma_format,
-                &bitrate,
-                &rate_mode,
-            );
-            config_ip.set_tile_size(tile_size);
-            config_ip.bit_depth = bit_depth;
-
-            // Warm up GPU shader pipelines (triggers Metal lazy compilation)
-            let _ = encoder.encode(&ctx, &frames_data[0], w, h, &config_ip);
-
-            let start = std::time::Instant::now();
-            let compressed_ip =
-                encoder.encode_sequence_with_fps(&ctx, &frame_refs, w, h, &config_ip, fps);
-            let elapsed_ip = start.elapsed();
-
-            println!("\n=== I+P+B (keyframe_interval={}) ===", keyframe_interval);
-
-            let frame_letter = |ft: gnc::FrameType| -> &'static str {
-                match ft {
-                    gnc::FrameType::Intra => "I",
-                    gnc::FrameType::Predicted => "P",
-                    gnc::FrameType::Bidirectional => "B",
+                let mut frame_metrics_i: Vec<FrameMetrics> = Vec::new();
+                // --- I+P encoding ---
+                let mut config_ip = build_ip_config(
+                    quality,
+                    qstep,
+                    keyframe_interval,
+                    rans,
+                    rice,
+                    abac,
+                    &chroma_format,
+                    &bitrate,
+                    &rate_mode,
+                );
+                config_ip.set_tile_size(tile_size);
+                config_ip.bit_depth = bit_depth;
+                if y4m_native {
+                    use_source_colour(&mut config_ip, source_chroma.unwrap());
                 }
-            };
 
-            if throughput {
-                // BUG-32: default wall clock is 86% CPU PSNR/SSIM plus a second all-I
-                // encode, and decode_sequence retains the whole sequence in RAM.
-                total_bytes_ip = 0;
-                frame_metrics_ip.clear();
-                for (i, cf) in compressed_ip.iter().enumerate() {
-                    let ft = frame_letter(cf.frame_type);
-                    total_bytes_ip += cf.byte_size();
+                // Warm up GPU shader pipelines (triggers Metal lazy compilation)
+                let _ = encoder.encode(&ctx, &frames_data[0], w, h, &config_ip);
+
+                let start = std::time::Instant::now();
+                let compressed_ip =
+                    encoder.encode_sequence_with_fps(&ctx, &frame_refs, w, h, &config_ip, fps);
+                let elapsed_ip = start.elapsed();
+
+                println!("\n=== I+P+B (keyframe_interval={}) ===", keyframe_interval);
+
+                let frame_letter = |ft: gnc::FrameType| -> &'static str {
+                    match ft {
+                        gnc::FrameType::Intra => "I",
+                        gnc::FrameType::Predicted => "P",
+                        gnc::FrameType::Bidirectional => "B",
+                    }
+                };
+
+                if throughput {
+                    // BUG-32: default wall clock is 86% CPU PSNR/SSIM plus a second all-I
+                    // encode, and decode_sequence retains the whole sequence in RAM.
+                    total_bytes_ip = 0;
+                    frame_metrics_ip.clear();
+                    for (i, cf) in compressed_ip.iter().enumerate() {
+                        let ft = frame_letter(cf.frame_type);
+                        total_bytes_ip += cf.byte_size();
+                        println!(
+                            "  Frame {:2} [{}]: {:6} bytes, {:.2} bpp",
+                            i,
+                            ft,
+                            cf.byte_size(),
+                            cf.bpp(),
+                        );
+                        frame_metrics_ip.push(FrameMetrics {
+                            frame_idx: i,
+                            frame_type: ft.to_string(),
+                            psnr: 0.0,
+                            ssim: 0.0,
+                            bpp: cf.bpp(),
+                            encoded_bytes: cf.byte_size(),
+                        });
+                    }
+                    avg_bpp_ip = compressed_ip.iter().map(|f| f.bpp()).sum::<f64>()
+                        / compressed_ip.len() as f64;
+                    let i_count = compressed_ip
+                        .iter()
+                        .filter(|f| f.frame_type == gnc::FrameType::Intra)
+                        .count();
+                    let p_count = compressed_ip
+                        .iter()
+                        .filter(|f| f.frame_type == gnc::FrameType::Predicted)
+                        .count();
+                    let b_count = compressed_ip
+                        .iter()
+                        .filter(|f| f.frame_type == gnc::FrameType::Bidirectional)
+                        .count();
                     println!(
-                        "  Frame {:2} [{}]: {:6} bytes, {:.2} bpp",
-                        i,
-                        ft,
-                        cf.byte_size(),
-                        cf.bpp(),
+                        "  Total: {} bytes, avg {:.2} bpp, {:.1}ms ({:.1} fps), {}I+{}P+{}B",
+                        total_bytes_ip,
+                        avg_bpp_ip,
+                        elapsed_ip.as_secs_f64() * 1000.0,
+                        compressed_ip.len() as f64 / elapsed_ip.as_secs_f64(),
+                        i_count,
+                        p_count,
+                        b_count,
                     );
-                    frame_metrics_ip.push(FrameMetrics {
-                        frame_idx: i,
-                        frame_type: ft.to_string(),
-                        psnr: 0.0,
-                        ssim: 0.0,
-                        bpp: cf.bpp(),
-                        encoded_bytes: cf.byte_size(),
-                    });
-                }
-                avg_bpp_ip = compressed_ip.iter().map(|f| f.bpp()).sum::<f64>()
-                    / compressed_ip.len() as f64;
-                let i_count = compressed_ip
-                    .iter()
-                    .filter(|f| f.frame_type == gnc::FrameType::Intra)
-                    .count();
-                let p_count = compressed_ip
-                    .iter()
-                    .filter(|f| f.frame_type == gnc::FrameType::Predicted)
-                    .count();
-                let b_count = compressed_ip
-                    .iter()
-                    .filter(|f| f.frame_type == gnc::FrameType::Bidirectional)
-                    .count();
-                println!(
-                    "  Total: {} bytes, avg {:.2} bpp, {:.1}ms ({:.1} fps), {}I+{}P+{}B",
-                    total_bytes_ip,
-                    avg_bpp_ip,
-                    elapsed_ip.as_secs_f64() * 1000.0,
-                    compressed_ip.len() as f64 / elapsed_ip.as_secs_f64(),
-                    i_count,
-                    p_count,
-                    b_count,
-                );
-                eprintln!("[bug32] throughput=1 metrics=0 i_only=0 decode_retained=0");
-            } else {
-            // Decode with B-frame reordering support
-            let decoded_all = decoder.decode_sequence(&ctx, &compressed_ip);
+                    eprintln!("[bug32] throughput=1 metrics=0 i_only=0 decode_retained=0");
+                } else {
+                    // Decode with B-frame reordering support
+                    let decoded_all = decoder.decode_sequence(&ctx, &compressed_ip);
 
-            // DIVERGENCE TEST: Compare encoder vs decoder decoded output (RGB)
-            // Note: cannot compare reference planes directly because the encoder
-            // skips local decode for the last P-frame in a sequence (optimization:
-            // the reference won't be used again). This means encoder gpu_ref_planes
-            // may be stale. Instead, compare decoded RGB output from both sides.
-            let ip_peak = max_val_for_depth(config_ip.bit_depth) as f32;
-            if diagnostics {
-                println!("\n=== ENCODE/DECODE QUALITY CHECK ===");
-                for (i, cf) in compressed_ip.iter().enumerate() {
-                    let ft = frame_letter(cf.frame_type);
-                    let psnr = quality::psnr(&frames_data[i], &decoded_all[i], ip_peak);
-                    let status = if psnr > 25.0 { "✓ OK" } else { "⚠ LOW" };
-                    eprintln!(
-                        "  Frame {:2} [{}] {}: PSNR={:.2} dB, {} bytes",
-                        i, ft, status, psnr, cf.byte_size()
+                    // DIVERGENCE TEST: Compare encoder vs decoder decoded output (RGB)
+                    // Note: cannot compare reference planes directly because the encoder
+                    // skips local decode for the last P-frame in a sequence (optimization:
+                    // the reference won't be used again). This means encoder gpu_ref_planes
+                    // may be stale. Instead, compare decoded RGB output from both sides.
+                    let ip_peak = max_val_for_depth(config_ip.bit_depth) as f32;
+                    if diagnostics {
+                        println!("\n=== ENCODE/DECODE QUALITY CHECK ===");
+                        for (i, cf) in compressed_ip.iter().enumerate() {
+                            let ft = frame_letter(cf.frame_type);
+                            let psnr = quality::psnr(&frames_data[i], &decoded_all[i], ip_peak);
+                            let status = if psnr > 25.0 { "✓ OK" } else { "⚠ LOW" };
+                            eprintln!(
+                                "  Frame {:2} [{}] {}: PSNR={:.2} dB, {} bytes",
+                                i,
+                                ft,
+                                status,
+                                psnr,
+                                cf.byte_size()
+                            );
+                        }
+                    }
+
+                    total_bytes_ip = 0;
+                    frame_metrics_ip.clear();
+                    for (i, cf) in compressed_ip.iter().enumerate() {
+                        let ft = frame_letter(cf.frame_type);
+                        let psnr = quality::psnr(&frames_data[i], &decoded_all[i], ip_peak);
+                        let ssim = quality::ssim_approx(&frames_data[i], &decoded_all[i], ip_peak);
+                        total_bytes_ip += cf.byte_size();
+                        println!(
+                            "  Frame {:2} [{}]: {:6} bytes, {:.2} bpp, PSNR {:.2} dB, SSIM {:.4}",
+                            i,
+                            ft,
+                            cf.byte_size(),
+                            cf.bpp(),
+                            psnr,
+                            ssim,
+                        );
+                        frame_metrics_ip.push(FrameMetrics {
+                            frame_idx: i,
+                            frame_type: ft.to_string(),
+                            psnr,
+                            ssim,
+                            bpp: cf.bpp(),
+                            encoded_bytes: cf.byte_size(),
+                        });
+                    }
+
+                    // VMAF scoring for I+P+B sequence.
+                    if vmaf {
+                        let tmp_ref = gnc::session_temp_path("gnc_ip_vmaf_ref.y4m");
+                        let tmp_dist = gnc::session_temp_path("gnc_ip_vmaf_dist.y4m");
+                        let fps_int = fps.round() as u32;
+                        let mut ref_wr = y4m_writer(
+                            tmp_ref.to_str().unwrap(),
+                            w as usize,
+                            h as usize,
+                            fps_int,
+                            1,
+                            y4m_native,
+                        );
+                        let mut dist_wr = y4m_writer(
+                            tmp_dist.to_str().unwrap(),
+                            w as usize,
+                            h as usize,
+                            fps_int,
+                            1,
+                            y4m_native,
+                        );
+                        for (orig, dec) in frames_data.iter().zip(decoded_all.iter()) {
+                            ref_wr.write_frame(orig);
+                            dist_wr.write_frame(dec);
+                        }
+                        ref_wr.flush();
+                        dist_wr.flush();
+                        print!("  VMAF: computing... ");
+                        use std::io::Write as _;
+                        std::io::stdout().flush().ok();
+                        match run_vmaf(tmp_ref.to_str().unwrap(), tmp_dist.to_str().unwrap()) {
+                            Some((mean, min, max)) => {
+                                println!("mean={:.2}  min={:.2}  max={:.2}", mean, min, max)
+                            }
+                            None => println!("failed (is vmaf in PATH?)"),
+                        }
+                        let _ = std::fs::remove_file(&tmp_ref);
+                        let _ = std::fs::remove_file(&tmp_dist);
+                    }
+
+                    avg_bpp_ip = compressed_ip.iter().map(|f| f.bpp()).sum::<f64>()
+                        / compressed_ip.len() as f64;
+                    let i_count = compressed_ip
+                        .iter()
+                        .filter(|f| f.frame_type == gnc::FrameType::Intra)
+                        .count();
+                    let p_count = compressed_ip
+                        .iter()
+                        .filter(|f| f.frame_type == gnc::FrameType::Predicted)
+                        .count();
+                    let b_count = compressed_ip
+                        .iter()
+                        .filter(|f| f.frame_type == gnc::FrameType::Bidirectional)
+                        .count();
+
+                    println!(
+                        "  Total: {} bytes, avg {:.2} bpp, {:.1}ms ({:.1} fps), {}I+{}P+{}B",
+                        total_bytes_ip,
+                        avg_bpp_ip,
+                        elapsed_ip.as_secs_f64() * 1000.0,
+                        compressed_ip.len() as f64 / elapsed_ip.as_secs_f64(),
+                        i_count,
+                        p_count,
+                        b_count,
                     );
-                }
-            }
 
-            total_bytes_ip = 0;
-            frame_metrics_ip.clear();
-            for (i, cf) in compressed_ip.iter().enumerate() {
-                let ft = frame_letter(cf.frame_type);
-                let psnr = quality::psnr(&frames_data[i], &decoded_all[i], ip_peak);
-                let ssim = quality::ssim_approx(&frames_data[i], &decoded_all[i], ip_peak);
-                total_bytes_ip += cf.byte_size();
-                println!(
-                    "  Frame {:2} [{}]: {:6} bytes, {:.2} bpp, PSNR {:.2} dB, SSIM {:.4}",
-                    i,
-                    ft,
-                    cf.byte_size(),
-                    cf.bpp(),
-                    psnr,
-                    ssim,
-                );
-                frame_metrics_ip.push(FrameMetrics {
-                    frame_idx: i,
-                    frame_type: ft.to_string(),
-                    psnr,
-                    ssim,
-                    bpp: cf.bpp(),
-                    encoded_bytes: cf.byte_size(),
-                });
-            }
+                    // Compute and display I+P sequence summary
+                    let summary_ip_local =
+                        sequence_metrics::compute_sequence_metrics(&frame_metrics_ip);
+                    summary_ip = Some(summary_ip_local.clone());
+                    println!("\n{}", summary_ip_local);
 
-            // VMAF scoring for I+P+B sequence.
-            if vmaf {
-                let tmp_ref  = gnc::session_temp_path("gnc_ip_vmaf_ref.y4m");
-                let tmp_dist = gnc::session_temp_path("gnc_ip_vmaf_dist.y4m");
-                let fps_int = fps.round() as u32;
-                let mut ref_wr = Y4mWriter::create(tmp_ref.to_str().unwrap(), w as usize, h as usize, fps_int, 1);
-                let mut dist_wr = Y4mWriter::create(tmp_dist.to_str().unwrap(), w as usize, h as usize, fps_int, 1);
-                for (orig, dec) in frames_data.iter().zip(decoded_all.iter()) {
-                    ref_wr.write_frame(orig);
-                    dist_wr.write_frame(dec);
-                }
-                ref_wr.flush();
-                dist_wr.flush();
-                print!("  VMAF: computing... ");
-                use std::io::Write as _;
-                std::io::stdout().flush().ok();
-                match run_vmaf(tmp_ref.to_str().unwrap(), tmp_dist.to_str().unwrap()) {
-                    Some((mean, min, max)) => println!("mean={:.2}  min={:.2}  max={:.2}", mean, min, max),
-                    None => println!("failed (is vmaf in PATH?)"),
-                }
-                let _ = std::fs::remove_file(&tmp_ref);
-                let _ = std::fs::remove_file(&tmp_dist);
-            }
+                    // --- All I-frame baseline ---
+                    let mut config_i = config_ip.clone();
+                    config_i.keyframe_interval = 1;
 
-            avg_bpp_ip =
-                compressed_ip.iter().map(|f| f.bpp()).sum::<f64>() / compressed_ip.len() as f64;
-            let i_count = compressed_ip
-                .iter()
-                .filter(|f| f.frame_type == gnc::FrameType::Intra)
-                .count();
-            let p_count = compressed_ip
-                .iter()
-                .filter(|f| f.frame_type == gnc::FrameType::Predicted)
-                .count();
-            let b_count = compressed_ip
-                .iter()
-                .filter(|f| f.frame_type == gnc::FrameType::Bidirectional)
-                .count();
+                    let start = std::time::Instant::now();
+                    let compressed_i = encoder.encode_sequence(&ctx, &frame_refs, w, h, &config_i);
+                    let elapsed_i = start.elapsed();
 
-            println!(
-                "  Total: {} bytes, avg {:.2} bpp, {:.1}ms ({:.1} fps), {}I+{}P+{}B",
-                total_bytes_ip,
-                avg_bpp_ip,
-                elapsed_ip.as_secs_f64() * 1000.0,
-                compressed_ip.len() as f64 / elapsed_ip.as_secs_f64(),
-                i_count,
-                p_count,
-                b_count,
-            );
+                    println!("=== All I-frames (baseline) ===");
+                    let mut total_bytes_i: usize = 0;
+                    frame_metrics_i.clear();
+                    let i_peak = max_val_for_depth(config_i.bit_depth) as f32;
+                    for (i, cf) in compressed_i.iter().enumerate() {
+                        let decoded = decoder.decode(&ctx, cf);
+                        let psnr = quality::psnr(&frames_data[i], &decoded, i_peak);
+                        let ssim = quality::ssim_approx(&frames_data[i], &decoded, i_peak);
+                        total_bytes_i += cf.byte_size();
+                        println!(
+                            "  Frame {:2} [I]: {:6} bytes, {:.2} bpp, PSNR {:.2} dB, SSIM {:.4}",
+                            i,
+                            cf.byte_size(),
+                            cf.bpp(),
+                            psnr,
+                            ssim,
+                        );
+                        frame_metrics_i.push(FrameMetrics {
+                            frame_idx: i,
+                            frame_type: "I".to_string(),
+                            psnr,
+                            ssim,
+                            bpp: cf.bpp(),
+                            encoded_bytes: cf.byte_size(),
+                        });
+                    }
 
-            // Compute and display I+P sequence summary
-            let summary_ip_local = sequence_metrics::compute_sequence_metrics(&frame_metrics_ip);
-            summary_ip = Some(summary_ip_local.clone());
-            println!("\n{}", summary_ip_local);
+                    let avg_bpp_i = compressed_i.iter().map(|f| f.bpp()).sum::<f64>()
+                        / compressed_i.len() as f64;
 
-            // --- All I-frame baseline ---
-            let mut config_i = config_ip.clone();
-            config_i.keyframe_interval = 1;
+                    println!(
+                        "  Total: {} bytes, avg {:.2} bpp, {:.1}ms ({:.1} fps)",
+                        total_bytes_i,
+                        avg_bpp_i,
+                        elapsed_i.as_secs_f64() * 1000.0,
+                        compressed_i.len() as f64 / elapsed_i.as_secs_f64(),
+                    );
 
-            let start = std::time::Instant::now();
-            let compressed_i = encoder.encode_sequence(&ctx, &frame_refs, w, h, &config_i);
-            let elapsed_i = start.elapsed();
+                    // Compute and display I-only sequence summary
+                    let summary_i = sequence_metrics::compute_sequence_metrics(&frame_metrics_i);
+                    println!("\n{}", summary_i);
 
-            println!("=== All I-frames (baseline) ===");
-            let mut total_bytes_i: usize = 0;
-            frame_metrics_i.clear();
-            let i_peak = max_val_for_depth(config_i.bit_depth) as f32;
-            for (i, cf) in compressed_i.iter().enumerate() {
-                let decoded = decoder.decode(&ctx, cf);
-                let psnr = quality::psnr(&frames_data[i], &decoded, i_peak);
-                let ssim = quality::ssim_approx(&frames_data[i], &decoded, i_peak);
-                total_bytes_i += cf.byte_size();
-                println!(
-                    "  Frame {:2} [I]: {:6} bytes, {:.2} bpp, PSNR {:.2} dB, SSIM {:.4}",
-                    i,
-                    cf.byte_size(),
-                    cf.bpp(),
-                    psnr,
-                    ssim,
-                );
-                frame_metrics_i.push(FrameMetrics {
-                    frame_idx: i,
-                    frame_type: "I".to_string(),
-                    psnr,
-                    ssim,
-                    bpp: cf.bpp(),
-                    encoded_bytes: cf.byte_size(),
-                });
-            }
-
-            let avg_bpp_i =
-                compressed_i.iter().map(|f| f.bpp()).sum::<f64>() / compressed_i.len() as f64;
-
-            println!(
-                "  Total: {} bytes, avg {:.2} bpp, {:.1}ms ({:.1} fps)",
-                total_bytes_i,
-                avg_bpp_i,
-                elapsed_i.as_secs_f64() * 1000.0,
-                compressed_i.len() as f64 / elapsed_i.as_secs_f64(),
-            );
-
-            // Compute and display I-only sequence summary
-            let summary_i = sequence_metrics::compute_sequence_metrics(&frame_metrics_i);
-            println!("\n{}", summary_i);
-
-            // --- Comparison ---
-            let saving_pct = (1.0 - total_bytes_ip as f64 / total_bytes_i as f64) * 100.0;
-            println!(
+                    // --- Comparison ---
+                    let saving_pct = (1.0 - total_bytes_ip as f64 / total_bytes_i as f64) * 100.0;
+                    println!(
                 "=== Comparison ===\n  I-only: {} bytes ({:.2} bpp)\n  I+P:    {} bytes ({:.2} bpp)\n  Saving: {:.1}%",
                 total_bytes_i, avg_bpp_i, total_bytes_ip, avg_bpp_ip, saving_pct,
             );
 
-            // Temporal consistency comparison
-            println!(
+                    // Temporal consistency comparison
+                    println!(
                 "\n=== Temporal Consistency ===\n  I+P:    max PSNR drop {:.2} dB, consistency {:.2} dB\n  I-only: max PSNR drop {:.2} dB, consistency {:.2} dB",
                 summary_ip.as_ref().unwrap().max_psnr_drop,
                 summary_ip.as_ref().unwrap().temporal_consistency,
                 summary_i.max_psnr_drop,
                 summary_i.temporal_consistency,
             );
-            } // else: quality metrics (BUG-32 --throughput skips this)
+                } // else: quality metrics (BUG-32 --throughput skips this)
 
-            // Write CSV if requested (I+P metrics — the primary encoding mode)
-            if let Some(ref csv_path) = csv {
-                if let Some(ref summary) = summary_ip {
-                    let out_path = if run_temporal {
-                        csv_with_suffix(csv_path, "ip")
-                    } else {
-                        csv_path.clone()
-                    };
-                    sequence_metrics::write_sequence_csv(
-                        &out_path,
-                        &frame_metrics_ip,
-                        summary,
-                    )
-                    .expect("Failed to write sequence CSV");
-                    println!("\nSequence metrics written to {}", out_path);
+                // Write CSV if requested (I+P metrics — the primary encoding mode)
+                if let Some(ref csv_path) = csv {
+                    if let Some(ref summary) = summary_ip {
+                        let out_path = if run_temporal {
+                            csv_with_suffix(csv_path, "ip")
+                        } else {
+                            csv_path.clone()
+                        };
+                        sequence_metrics::write_sequence_csv(&out_path, &frame_metrics_ip, summary)
+                            .expect("Failed to write sequence CSV");
+                        println!("\nSequence metrics written to {}", out_path);
+                    }
                 }
-            }
 
-            // Write GNV1 container if --output specified and not in temporal wavelet mode
-            if let Some(ref output_path) = output {
-                if !run_temporal {
-                    let fps_num = fps.round() as u32;
-                    let gnv1_data = serialize_sequence(&compressed_ip, (fps_num, 1));
-                    std::fs::write(output_path, &gnv1_data).expect("Failed to write GNV1 output");
-                    println!("\nGNV1 container written to {} ({} bytes)", output_path, gnv1_data.len());
+                // Write GNV1 container if --output specified and not in temporal wavelet mode
+                if let Some(ref output_path) = output {
+                    if !run_temporal {
+                        let fps_num = fps.round() as u32;
+                        let gnv1_data = serialize_sequence(&compressed_ip, (fps_num, 1));
+                        std::fs::write(output_path, &gnv1_data)
+                            .expect("Failed to write GNV1 output");
+                        println!(
+                            "\nGNV1 container written to {} ({} bytes)",
+                            output_path,
+                            gnv1_data.len()
+                        );
+                    }
                 }
-            }
             }
 
             if run_temporal {
@@ -2661,8 +3442,14 @@ fn main() {
                 }
                 println!(
                     "Temporal config: qstep {:.3}, dead_zone {:.3}, entropy {:?}, adaptive_mul {}",
-                    config_tw.quantization_step, config_tw.dead_zone, config_tw.entropy_coder,
-                    if config_tw.adaptive_temporal_mul { "on" } else { "off" },
+                    config_tw.quantization_step,
+                    config_tw.dead_zone,
+                    config_tw.entropy_coder,
+                    if config_tw.adaptive_temporal_mul {
+                        "on"
+                    } else {
+                        "off"
+                    },
                 );
 
                 let start = std::time::Instant::now();
@@ -2726,12 +3513,7 @@ fn main() {
                     );
                     let mut originals: Vec<[Vec<f32>; 3]> = Vec::new();
                     for fd in &frames_data[..gop] {
-                        originals.push(encoder.debug_wavelet_prequant(
-                            &ctx,
-                            fd,
-                            &info,
-                            &config_tw,
-                        ));
+                        originals.push(encoder.debug_wavelet_prequant(&ctx, fd, &info, &config_tw));
                     }
                     // Pure temporal Haar roundtrip on wavelet coeffs (no quant/entropy)
                     if temporal_mode == TemporalTransform::Haar {
@@ -2900,10 +3682,7 @@ fn main() {
                     }
                 }
 
-                println!(
-                    "\n=== Temporal wavelet ({:?}) ===",
-                    temporal_mode
-                );
+                println!("\n=== Temporal wavelet ({:?}) ===", temporal_mode);
                 let decoded_tw = decoder.decode_temporal_sequence(&ctx, &encoded_tw);
 
                 // Bytes per output frame: distribute group bytes evenly across frames
@@ -2969,12 +3748,7 @@ fn main() {
                     };
                     println!(
                         "  Frame {:2} [{}]: {:6.0} bytes, {:.2} bpp, PSNR {:.2} dB, SSIM {:.4}",
-                        i,
-                        frame_type,
-                        bytes,
-                        bpp,
-                        psnr,
-                        ssim,
+                        i, frame_type, bytes, bpp, psnr, ssim,
                     );
                     frame_metrics_tw.push(FrameMetrics {
                         frame_idx: i,
@@ -2986,8 +3760,9 @@ fn main() {
                     });
                 }
 
-                let avg_bpp_tw =
-                    per_frame_bytes.iter().sum::<f64>() * 8.0 / (w as f64 * h as f64) / frames_data.len() as f64;
+                let avg_bpp_tw = per_frame_bytes.iter().sum::<f64>() * 8.0
+                    / (w as f64 * h as f64)
+                    / frames_data.len() as f64;
                 println!(
                     "  Total: {} bytes, avg {:.2} bpp, {:.1}ms ({:.1} fps)",
                     total_bytes_tw,
@@ -3003,8 +3778,8 @@ fn main() {
                         total_low_bytes, low_pct, total_high_bytes, high_pct
                     );
                     if !low_frame_sizes.is_empty() {
-                        let low_avg =
-                            low_frame_sizes.iter().sum::<usize>() as f64 / low_frame_sizes.len() as f64;
+                        let low_avg = low_frame_sizes.iter().sum::<usize>() as f64
+                            / low_frame_sizes.len() as f64;
                         println!(
                             "  Temporal lowpass frames: {} (avg {:.0} bytes)",
                             low_frame_sizes.len(),
@@ -3012,8 +3787,8 @@ fn main() {
                         );
                     }
                     if !high_frame_sizes.is_empty() {
-                        let high_avg =
-                            high_frame_sizes.iter().sum::<usize>() as f64 / high_frame_sizes.len() as f64;
+                        let high_avg = high_frame_sizes.iter().sum::<usize>() as f64
+                            / high_frame_sizes.len() as f64;
                         println!(
                             "  Temporal highpass frames: {} (avg {:.0} bytes)",
                             high_frame_sizes.len(),
@@ -3169,9 +3944,7 @@ fn main() {
                 eprintln!(
                     "encode-sequence only supports I+P (motion vector) mode (--temporal-wavelet none)."
                 );
-                eprintln!(
-                    "For temporal wavelet encoding, use: benchmark-sequence -o output.gnv2"
-                );
+                eprintln!("For temporal wavelet encoding, use: benchmark-sequence -o output.gnv2");
                 std::process::exit(1);
             }
 
@@ -3251,13 +4024,23 @@ fn main() {
             }
 
             let input_pattern = input.clone();
+            // The frame source is called *inside* the timed region, so PNG decode lands in
+            // `encode_time` and therefore in the fps figure printed below. Measured 2026-09-08
+            // (MEAS-12) it is about 15 of 51 ms per 1080p frame — 29% of that figure. Time it
+            // separately rather than leave the number quietly inflated.
+            let load_nanos = std::sync::atomic::AtomicU64::new(0);
             let start = std::time::Instant::now();
             let compressed = encoder.encode_sequence_streaming(
                 &ctx,
                 frame_count,
                 |i| {
+                    let load_start = std::time::Instant::now();
                     let path = input_pattern.replace("%04d", &format!("{:04}", i));
                     let (rgb, fw, fh) = load_image_rgb_f32_bits(&path, bit_depth);
+                    load_nanos.fetch_add(
+                        load_start.elapsed().as_nanos() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     assert!(
                         fw == w && fh == h,
                         "Frame {} has different dimensions ({}x{} vs {}x{})",
@@ -3294,20 +4077,38 @@ fn main() {
             let gnv_data = serialize_sequence(&compressed, (fps_num, fps_den));
             std::fs::write(&output, &gnv_data).expect("Failed to write GNV1 output");
 
-            let avg_bpp =
-                compressed.iter().map(|f| f.bpp()).sum::<f64>() / compressed.len() as f64;
+            let avg_bpp = compressed.iter().map(|f| f.bpp()).sum::<f64>() / compressed.len() as f64;
             let i_count = compressed
                 .iter()
                 .filter(|f| f.frame_type == gnc::FrameType::Intra)
                 .count();
 
+            // Two figures, not one. This command reads PNG, and the decode happens inside the
+            // timed region, so the combined figure is not GNC's encoder throughput. Anyone
+            // comparing against another codec's encoder wants the second line.
+            let load_secs =
+                load_nanos.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1_000_000_000.0;
+            let coding_secs = (encode_time.as_secs_f64() - load_secs).max(f64::MIN_POSITIVE);
             println!(
-                "\nEncoded {} frames ({}I + {}P) in {:.1}ms ({:.1} fps)",
+                "\nEncoded {} frames ({}I + {}P) in {:.1}ms ({:.1} fps) — includes PNG decode",
                 compressed.len(),
                 i_count,
                 compressed.len() - i_count,
                 encode_time.as_secs_f64() * 1000.0,
                 compressed.len() as f64 / encode_time.as_secs_f64(),
+            );
+            println!(
+                "  of which input decode {:.1}ms ({:.0}%); coding alone {:.1}ms ({:.1} fps)",
+                load_secs * 1000.0,
+                100.0 * load_secs / encode_time.as_secs_f64(),
+                coding_secs * 1000.0,
+                compressed.len() as f64 / coding_secs,
+            );
+            println!(
+                "  Quote the coding figure against another encoder, the combined one for \
+                 end-to-end throughput, and neither without saying which (BASELINE, \"How to \
+                 read the fps figures in this file\"). Y4M input via `benchmark-sequence` avoids \
+                 the decode entirely."
             );
             println!(
                 "Container: {} bytes, avg {:.2} bpp → {}",
@@ -3464,8 +4265,7 @@ fn main() {
                             true
                         };
                         if should_output {
-                            let frame_path =
-                                output.replace("%04d", &format!("{:04}", abs_idx));
+                            let frame_path = output.replace("%04d", &format!("{:04}", abs_idx));
                             save_image_rgb_f32_bits(
                                 &frame_path,
                                 rgb_data,
@@ -3477,7 +4277,6 @@ fn main() {
                         }
                     }
                 }
-
 
                 let decode_time = start.elapsed();
                 let decoded_count = end_frame - start_frame;
@@ -3540,11 +4339,28 @@ fn main() {
                 // CSV writer
                 let mut wtr = csv::Writer::from_path(&output).expect("Failed to create CSV file");
                 if vmaf {
-                    wtr.write_record(["q", "qstep", "psnr", "ssim", "bpp", "encode_ms", "decode_ms", "vmaf"])
-                        .expect("Failed to write CSV header");
+                    wtr.write_record([
+                        "q",
+                        "qstep",
+                        "psnr",
+                        "ssim",
+                        "bpp",
+                        "encode_ms",
+                        "decode_ms",
+                        "vmaf",
+                    ])
+                    .expect("Failed to write CSV header");
                 } else {
-                    wtr.write_record(["q", "qstep", "psnr", "ssim", "bpp", "encode_ms", "decode_ms"])
-                        .expect("Failed to write CSV header");
+                    wtr.write_record([
+                        "q",
+                        "qstep",
+                        "psnr",
+                        "ssim",
+                        "bpp",
+                        "encode_ms",
+                        "decode_ms",
+                    ])
+                    .expect("Failed to write CSV header");
                 }
 
                 // Print table header
@@ -3563,7 +4379,7 @@ fn main() {
                 }
 
                 // Temp Y4M paths for per-point VMAF scoring (reused across quality points)
-                let vmaf_tmp_ref  = gnc::session_temp_path("gnc_rdcurve_vmaf_ref.y4m");
+                let vmaf_tmp_ref = gnc::session_temp_path("gnc_rdcurve_vmaf_ref.y4m");
                 let vmaf_tmp_dist = gnc::session_temp_path("gnc_rdcurve_vmaf_dist.y4m");
 
                 for &q in &q_vals {
@@ -3599,22 +4415,38 @@ fn main() {
                     // VMAF scoring for this quality point
                     let vmaf_score: Option<f64> = if vmaf {
                         {
-                            let mut ref_wr = Y4mWriter::create(vmaf_tmp_ref.to_str().unwrap(), w as usize, h as usize, 1, 1);
+                            let mut ref_wr = Y4mWriter::create(
+                                vmaf_tmp_ref.to_str().unwrap(),
+                                w as usize,
+                                h as usize,
+                                1,
+                                1,
+                            );
                             ref_wr.write_frame(&rgb_data);
                             ref_wr.flush();
-                            let mut dist_wr = Y4mWriter::create(vmaf_tmp_dist.to_str().unwrap(), w as usize, h as usize, 1, 1);
+                            let mut dist_wr = Y4mWriter::create(
+                                vmaf_tmp_dist.to_str().unwrap(),
+                                w as usize,
+                                h as usize,
+                                1,
+                                1,
+                            );
                             dist_wr.write_frame(&reconstructed);
                             dist_wr.flush();
                         }
-                        run_vmaf(vmaf_tmp_ref.to_str().unwrap(), vmaf_tmp_dist.to_str().unwrap())
-                            .map(|(mean, _, _)| mean)
+                        run_vmaf(
+                            vmaf_tmp_ref.to_str().unwrap(),
+                            vmaf_tmp_dist.to_str().unwrap(),
+                        )
+                        .map(|(mean, _, _)| mean)
                     } else {
                         None
                     };
 
                     // Write CSV row
                     if vmaf {
-                        let vmaf_str = vmaf_score.map_or_else(|| "N/A".to_string(), |v| format!("{:.2}", v));
+                        let vmaf_str =
+                            vmaf_score.map_or_else(|| "N/A".to_string(), |v| format!("{:.2}", v));
                         wtr.write_record(&[
                             format!("{}", q),
                             format!("{:.4}", qstep),
@@ -3641,7 +4473,8 @@ fn main() {
 
                     // Print table row
                     if vmaf {
-                        let vmaf_col = vmaf_score.map_or_else(|| "  N/A".to_string(), |v| format!("{:>8.2}", v));
+                        let vmaf_col = vmaf_score
+                            .map_or_else(|| "  N/A".to_string(), |v| format!("{:>8.2}", v));
                         println!(
                             "{:>5} {:>8.4} {:>8.2} {:>8.4} {:>8.4} {:>10.2} {:>10.2} {}",
                             q, qstep, psnr, ssim, bpp, encode_ms, decode_ms, vmaf_col
@@ -3958,7 +4791,13 @@ fn main() {
                             gop_frames.iter().map(|f| f.as_slice()).collect();
                         let t0 = std::time::Instant::now();
                         let group = encoder.encode_temporal_wavelet_gop(
-                            &ctx, &gop_refs, w, h, &config_tw, temporal_mode, None,
+                            &ctx,
+                            &gop_refs,
+                            w,
+                            h,
+                            &config_tw,
+                            temporal_mode,
+                            None,
                         );
                         enc_time += t0.elapsed();
                         let group_bytes: usize = group.low_frame.byte_size()
@@ -4060,8 +4899,18 @@ fn main() {
 
                 csv_rows.push(format!(
                     "{},{},{},{:?},{:.4},{:.2},{:.2},{:.2},{:.2},{:.1},{:.1},{}",
-                    seq_name, num_frames, quality, temporal_mode, avg_bpp, psnr_avg, psnr_min,
-                    psnr_lp_avg, psnr_lp_min, fps_enc, fps_dec, total_bytes,
+                    seq_name,
+                    num_frames,
+                    quality,
+                    temporal_mode,
+                    avg_bpp,
+                    psnr_avg,
+                    psnr_min,
+                    psnr_lp_avg,
+                    psnr_lp_min,
+                    fps_enc,
+                    fps_dec,
+                    total_bytes,
                 ));
             }
 
@@ -4093,5 +4942,92 @@ fn main() {
             // Fused mega-kernel benchmark
             experiments::transform_shootout::run_fused_benchmark(&ctx, &rgb_data, w, h, iterations);
         }
+    }
+}
+
+/// BUG-56 — the Y4M reader's chroma handling.
+///
+/// Until 2026-09-11 the format was decided by `starts_with("444")` or else 4:2:0, so **every**
+/// other format was assumed to be 4:2:0. A `C422` file has twice the chroma rows that assumption
+/// allocates: the reader consumed half of them, walked off the plane boundary, and panicked at the
+/// next frame header — while GOALS §1 headlines 10-bit 4:2:2 and the encoder has coded it for
+/// months. The codec could code 4:2:2; the tool could not read it.
+///
+/// These tests use **two-frame** files on purpose. A wrong plane size does not corrupt frame one —
+/// it desynchronises the stream, and the damage shows up as a missing second `FRAME` header. That
+/// is the shape the bug actually had, so it is the shape the guard checks.
+#[cfg(test)]
+mod y4m_tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Write a synthetic two-frame Y4M with the given `C` tag and chroma plane size.
+    fn write_y4m(name: &str, tag: &str, w: usize, h: usize, uv_len: usize) -> String {
+        // Through the helper, not around it: it owns the per-process suffix that keeps concurrent
+        // sessions from sharing a temp file (BUG-36), and `tests/temp_path_collision.rs` enforces
+        // that there is exactly one place doing it. Hand-rolling the same suffix here still failed
+        // that guard, correctly — the rule is about where the knowledge lives, not the result.
+        let path = gnc::session_temp_path(&format!("gnc_bug56_{name}.y4m"));
+        let mut f = std::fs::File::create(&path).expect("create temp y4m");
+        writeln!(f, "YUV4MPEG2 W{w} H{h} F30:1 Ip A0:0 C{tag}").unwrap();
+        for frame in 0..2u8 {
+            f.write_all(b"FRAME\n").unwrap();
+            f.write_all(&vec![16 + frame; w * h]).unwrap();
+            f.write_all(&vec![100 + frame; uv_len]).unwrap();
+            f.write_all(&vec![200 + frame; uv_len]).unwrap();
+        }
+        path.to_string_lossy().into_owned()
+    }
+
+    fn reads_two_frames(path: &str) -> bool {
+        let mut r = Y4mReader::open(path);
+        let a = r.read_frame_planes().is_some();
+        let b = r.read_frame_planes().is_some();
+        let eof = r.read_frame_planes().is_none();
+        a && b && eof
+    }
+
+    #[test]
+    fn y4m_422_reads_both_frames_and_reports_422() {
+        let (w, h) = (16usize, 8usize);
+        let p = write_y4m("422", "422", w, h, w.div_ceil(2) * h);
+        let r = Y4mReader::open(&p);
+        assert_eq!(
+            r.chroma_format(),
+            gnc::ChromaFormat::Yuv422,
+            "a C422 file must be read as 4:2:2, not guessed as 4:2:0 (BUG-56)"
+        );
+        assert!(
+            reads_two_frames(&p),
+            "the 4:2:2 stream desynchronised — the chroma planes are being read at the wrong size, \
+             which is exactly how BUG-56 presented"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn y4m_420_and_444_are_unaffected() {
+        let (w, h) = (16usize, 8usize);
+        for (tag, uv, want) in [
+            (
+                "420jpeg",
+                w.div_ceil(2) * h.div_ceil(2),
+                gnc::ChromaFormat::Yuv420,
+            ),
+            ("444", w * h, gnc::ChromaFormat::Yuv444),
+        ] {
+            let p = write_y4m(tag, tag, w, h, uv);
+            assert_eq!(Y4mReader::open(&p).chroma_format(), want, "{tag} misread");
+            assert!(reads_two_frames(&p), "{tag} desynchronised");
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "is not supported")]
+    fn an_unknown_chroma_tag_is_refused_rather_than_guessed() {
+        let (w, h) = (16usize, 8usize);
+        let p = write_y4m("mono", "mono", w, h, 0);
+        let _ = Y4mReader::open(&p);
     }
 }

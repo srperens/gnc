@@ -139,7 +139,8 @@ fn run(label: &str, wgsl: &str, workgroups: u32, iters: u32) -> f64 {
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    ctx.queue.write_buffer(&ubuf, 0, bytemuck::cast_slice(&params));
+    ctx.queue
+        .write_buffer(&ubuf, 0, bytemuck::cast_slice(&params));
 
     let mk = || {
         d.create_buffer(&wgpu::BufferDescriptor {
@@ -156,9 +157,18 @@ fn run(label: &str, wgsl: &str, workgroups: u32, iters: u32) -> f64 {
         label: None,
         layout: &pipeline.get_bind_group_layout(0),
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: ubuf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: src.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: dst.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: ubuf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: src.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: dst.as_entire_binding(),
+            },
         ],
     });
 
@@ -201,9 +211,20 @@ fn serial_dependency_cost() {
     let ms_wave = run("wavefront", &wavefront_wgsl(), TILES_TOTAL, iters);
 
     println!("\n  Serial-dependency cost, {WIDTH}x{HEIGHT} x{PLANES} planes ({px} px), {iters} iterations\n");
-    println!("    independent (1 thread/px, no dependency) : {ms_indep:7.3} ms   {:6.1} fps", 1000.0 / ms_indep);
-    println!("    wavefront   (511 diagonals, 1 wg/tile)   : {ms_wave:7.3} ms   {:6.1} fps", 1000.0 / ms_wave);
-    println!("\n    wavefront costs {:.1}x the independent pass", ms_wave / ms_indep);
-    println!("    per-frame budget at 50 fps is 20 ms; this pass alone uses {:.1}%\n",
-             ms_wave / 20.0 * 100.0);
+    println!(
+        "    independent (1 thread/px, no dependency) : {ms_indep:7.3} ms   {:6.1} fps",
+        1000.0 / ms_indep
+    );
+    println!(
+        "    wavefront   (511 diagonals, 1 wg/tile)   : {ms_wave:7.3} ms   {:6.1} fps",
+        1000.0 / ms_wave
+    );
+    println!(
+        "\n    wavefront costs {:.1}x the independent pass",
+        ms_wave / ms_indep
+    );
+    println!(
+        "    per-frame budget at 50 fps is 20 ms; this pass alone uses {:.1}%\n",
+        ms_wave / 20.0 * 100.0
+    );
 }
